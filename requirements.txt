@@ -1,0 +1,16 @@
+# Core numeric/data stack
+numpy
+pandas
+scipy
+
+# Computer vision + tracking
+opencv-python
+ultralytics
+deep-sort-realtime
+
+# RL + environment
+gymnasium
+stable-baselines3
+
+# Deep learning backend (used by predictor and realtime control)
+torch

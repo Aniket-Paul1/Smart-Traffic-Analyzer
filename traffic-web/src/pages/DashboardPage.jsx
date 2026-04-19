@@ -18,9 +18,8 @@ export default function DashboardPage() {
   return (
     <div className="space-y-4">
       <p className="rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
-        Lane timers, density bars, and prediction charts are driven by an in-browser simulation in{' '}
-        <code className="text-slate-300">TrafficContext</code> — not by analyzing the demo video pixels. The clip is only a visual
-        stand-in for a CCTV feed.
+        Lane timers and signal decisions are AI-driven from recorded lane footage logs (YOLO/DeepSORT pipeline + adaptive control).
+        Only lanes with configured videos participate in green-time decisions.
       </p>
       {!canAccessAuthority && (
         <p className="rounded-lg border border-amber-800/40 bg-amber-950/25 px-3 py-2 text-xs text-amber-200/90">

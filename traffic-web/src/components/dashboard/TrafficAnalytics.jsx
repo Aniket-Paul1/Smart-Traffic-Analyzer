@@ -18,10 +18,15 @@ import { useTraffic } from '../../context/TrafficContext'
 const laneColor = (v) => (v < 0.33 ? '#22c55e' : v < 0.66 ? '#f59e0b' : '#ef4444')
 
 export default function TrafficAnalytics() {
-  const { densitySeries, lanes, averageWait, peakLane } = useTraffic()
-  const lineData = densitySeries.map((item) => ({ t: item.t, avg: lanes.reduce((a, l) => a + l.density, 0) / lanes.length }))
-  const barData = lanes.map((lane) => ({ name: lane.name, congestion: lane.congestion, density: lane.density }))
-  const pieData = lanes.map((lane) => ({ name: lane.name, value: Number((lane.density * 100).toFixed(1)) }))
+  const { densitySeries, activeLanes, averageWait, peakLane } = useTraffic()
+  const activeKeys = activeLanes.map((lane) => `lane${lane.id}`)
+  const lineData = densitySeries.map((item) => {
+    if (activeKeys.length === 0) return { t: item.t, avg: 0 }
+    const avg = activeKeys.reduce((acc, key) => acc + Number(item[key] || 0), 0) / activeKeys.length
+    return { t: item.t, avg }
+  })
+  const barData = activeLanes.map((lane) => ({ name: lane.name, congestion: lane.congestion, density: lane.density }))
+  const pieData = activeLanes.map((lane) => ({ name: lane.name, value: Number((lane.density * 100).toFixed(1)) }))
 
   return (
     <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
@@ -48,14 +53,14 @@ export default function TrafficAnalytics() {
         <div className="h-64 rounded-xl border border-slate-800 bg-slate-950/60 p-2">
           <p className="mb-1 text-xs text-slate-400">Congestion Per Lane</p>
           <ResponsiveContainer width="100%" height="92%">
-            <BarChart data={barData}>
+            <BarChart data={barData.length > 0 ? barData : [{ name: 'No video lanes', congestion: 0, density: 0 }]}>
               <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis dataKey="name" hide />
-              <YAxis stroke="#94a3b8" />
+              <XAxis dataKey="name" stroke="#94a3b8" interval={0} angle={-20} textAnchor="end" height={48} />
+              <YAxis stroke="#94a3b8" domain={[0, 100]} />
               <Tooltip />
               <Legend />
-              <Bar dataKey="congestion">
-                {barData.map((entry) => (
+              <Bar dataKey="congestion" minPointSize={4}>
+                {(barData.length > 0 ? barData : [{ name: 'No video lanes', density: 0 }]).map((entry) => (
                   <Cell key={entry.name} fill={laneColor(entry.density)} />
                 ))}
               </Bar>
@@ -67,8 +72,8 @@ export default function TrafficAnalytics() {
           <p className="mb-1 text-xs text-slate-400">Traffic Distribution</p>
           <ResponsiveContainer width="100%" height="92%">
             <PieChart>
-              <Pie data={pieData} dataKey="value" nameKey="name" outerRadius={85} label>
-                {pieData.map((entry, i) => (
+              <Pie data={pieData.length > 0 ? pieData : [{ name: 'No video lanes', value: 100 }]} dataKey="value" nameKey="name" outerRadius={85} label>
+                {(pieData.length > 0 ? pieData : [{ name: 'No video lanes', value: 100 }]).map((entry, i) => (
                   <Cell key={entry.name} fill={['#22c55e', '#06b6d4', '#f59e0b', '#ef4444'][i % 4]} />
                 ))}
               </Pie>

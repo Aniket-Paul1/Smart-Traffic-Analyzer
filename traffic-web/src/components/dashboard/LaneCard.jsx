@@ -1,10 +1,6 @@
 import clsx from 'clsx'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTraffic } from '../../context/TrafficContext'
-
-/** Fallback when `lane.streamUrl` is not set; metrics still come from simulation unless you wire vision separately. */
-const DEMO_FEED =
-  'https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4'
 
 function SignalLight({ active, color }) {
   return (
@@ -23,8 +19,23 @@ export default function LaneCard({ lane }) {
   const density = densityMeta(lane.density)
   const isGreen = lane.status === 'GREEN'
   const [feedFailed, setFeedFailed] = useState(false)
-  const streamSrc = lane.streamUrl?.trim() ? lane.streamUrl.trim() : DEMO_FEED
-  const isLive = Boolean(lane.streamUrl?.trim())
+  const streamSrc = lane.streamUrl?.trim() ? lane.streamUrl.trim() : null
+  const hasVideo = Boolean(streamSrc)
+  const videoRef = useRef(null)
+
+  useEffect(() => {
+    const el = videoRef.current
+    if (!el) return
+    if (!hasVideo) return
+    if (feedFailed) return
+
+    if (isGreen) {
+      const p = el.play()
+      if (p && typeof p.catch === 'function') p.catch(() => {})
+    } else {
+      el.pause()
+    }
+  }, [isGreen, hasVideo, feedFailed])
 
   return (
     <article className="rounded-xl border border-slate-700 bg-slate-900 p-3 shadow-md">
@@ -33,34 +44,40 @@ export default function LaneCard({ lane }) {
         <span className="text-xs text-slate-400">{lane.videoLabel}</span>
       </div>
       <div className="relative mb-3 h-24 overflow-hidden rounded-lg bg-slate-800">
-        {!feedFailed && (
+        {hasVideo && !feedFailed && (
           <video
             key={streamSrc}
+            ref={videoRef}
             className="absolute inset-0 h-full w-full object-cover opacity-80"
             src={streamSrc}
             muted
             playsInline
-            autoPlay
-            loop={!isLive}
+            loop
             preload="metadata"
             onError={() => setFeedFailed(true)}
           />
         )}
-        {feedFailed && (
+        {hasVideo && feedFailed && (
           <div className="absolute inset-0 bg-slate-800">
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(34,211,238,0.25),transparent_70%)]" />
             <div className="absolute inset-0 flex items-center justify-center text-[10px] text-slate-500">Feed unavailable (offline?)</div>
           </div>
         )}
+        {!hasVideo && (
+          <div className="absolute inset-0 bg-slate-800">
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(148,163,184,0.18),transparent_70%)]" />
+            <div className="absolute inset-0 flex items-center justify-center text-[10px] text-slate-400">NULL</div>
+          </div>
+        )}
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(34,211,238,0.15),transparent_70%)]" />
         <div className="absolute right-2 top-2 rounded bg-slate-950/70 px-2 py-0.5 text-[10px] text-slate-300">
-          {isLive ? 'LIVE' : 'DEMO'}
+          {hasVideo ? (isGreen ? 'PLAYING' : 'PAUSED') : 'NO VIDEO'}
         </div>
-        <div className="absolute bottom-2 left-2 text-xs text-slate-200 drop-shadow-md">{isGreen ? 'Vehicle flow active' : 'Queued at signal'}</div>
+        <div className="absolute bottom-2 left-2 text-xs text-slate-200 drop-shadow-md">
+          {!hasVideo ? 'waiting for signal' : isGreen ? 'Vehicle flow active' : 'Queued at signal'}
+        </div>
       </div>
-      <p className="mb-2 text-[10px] leading-tight text-slate-500">
-        Countdown &amp; density are simulated in the app (not computed from this clip).
-      </p>
+      <p className="mb-2 text-[10px] leading-tight text-slate-500">{!hasVideo ? 'Lane not configured in this intersection.' : 'Countdown & density are simulated (not computed from pixels).'}</p>
 
       <div className="mb-2 flex items-center justify-between text-xs">
         <div className="flex items-center gap-1.5">

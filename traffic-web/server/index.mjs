@@ -6,14 +6,19 @@ import cors from 'cors'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import initSqlJs from 'sql.js'
-import { parkingNearLocation, planRoutes } from './demoGeo.mjs'
+import { haversineKm, PARKING_ZONES, PLACES, parkingNearLocation, planRoutes } from './demoGeo.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(__dirname, 'data')
 const DB_PATH = path.join(DATA_DIR, 'traffic.db')
+const ROOT_DIR = path.resolve(__dirname, '..', '..')
+const LOGS_DIR = path.join(ROOT_DIR, 'logs')
 const JWT_SECRET = process.env.JWT_SECRET || 'traffic-dev-secret-change-in-production'
 const PORT = Number(process.env.PORT) || 3001
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173'
+const GEO_ROUTE_API_URL = process.env.GEO_ROUTE_API_URL || ''
+const GEO_PARKING_API_URL = process.env.GEO_PARKING_API_URL || ''
+const GEO_API_KEY = process.env.GEO_API_KEY || ''
 
 /** Exact display name on signup creates the single administrator account (only if none exists yet). */
 const ADMIN_SIGNUP_NAME = '1*1@admin'
@@ -171,9 +176,181 @@ function listUsersSafe() {
   return rows
 }
 
+function parseSimpleCsv(raw) {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+  if (lines.length < 2) return []
+  const headers = lines[0].split(',').map((h) => h.trim())
+  return lines.slice(1).map((line) => {
+    const cols = line.split(',').map((c) => c.trim())
+    const row = {}
+    headers.forEach((h, i) => {
+      row[h] = cols[i] ?? ''
+    })
+    return row
+  })
+}
+
+function inferDensityFromRow(row) {
+  if (!row) return 0
+  const keys = Object.keys(row)
+  const laneKeys = keys.filter((k) => /^density_lane_\d+$/.test(k))
+  if (laneKeys.length > 0) {
+    const vals = laneKeys
+      .map((k) => Number(row[k]))
+      .filter((v) => Number.isFinite(v))
+    if (vals.length > 0) return Math.max(...vals)
+  }
+  const legacy = Number(row.density)
+  return Number.isFinite(legacy) ? legacy : 0
+}
+
+function loadLaneReplays() {
+  if (!fs.existsSync(LOGS_DIR)) return []
+  const files = fs
+    .readdirSync(LOGS_DIR)
+    .filter((f) => f.endsWith('_timeseries.csv'))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+  return files.map((f) => {
+    const full = path.join(LOGS_DIR, f)
+    const rows = parseSimpleCsv(fs.readFileSync(full, 'utf8'))
+    return {
+      name: f,
+      rows,
+      maxDensity: Math.max(1, ...rows.map((r) => inferDensityFromRow(r))),
+    }
+  })
+}
+
+const laneReplays = loadLaneReplays()
+const PSEUDO_LIVE_WARMUP_FRAMES = Number(process.env.PSEUDO_LIVE_WARMUP_FRAMES || 120)
+const PSEUDO_LIVE_SMOOTH_WINDOW = Number(process.env.PSEUDO_LIVE_SMOOTH_WINDOW || 45)
+let replayCursor = Math.max(0, PSEUDO_LIVE_WARMUP_FRAMES)
+let lastServedLaneId = null
+
+const EMPTY_THRESHOLD = 0.05
+const VERY_HIGH_THRESHOLD = 0.75
+
+function mapDurationFromCongestion(norm) {
+  if (norm <= EMPTY_THRESHOLD) return 40
+  if (norm >= VERY_HIGH_THRESHOLD) return 90
+  const t = (norm - EMPTY_THRESHOLD) / (VERY_HIGH_THRESHOLD - EMPTY_THRESHOLD)
+  return Math.round(45 + t * 40)
+}
+
+function pickRoundRobinLane(candidateIds) {
+  if (candidateIds.length === 0) return null
+  const ids = [...candidateIds].sort((a, b) => a - b)
+  if (lastServedLaneId == null) return ids[0]
+  const idx = ids.findIndex((id) => id === lastServedLaneId)
+  if (idx === -1) return ids[0]
+  return ids[(idx + 1) % ids.length]
+}
+
+function laneCongestionAtCursor(replay, cursor) {
+  if (!replay || replay.rows.length === 0) return null
+  const len = replay.rows.length
+  const w = Math.max(1, Math.min(len, PSEUDO_LIVE_SMOOTH_WINDOW))
+  let sum = 0
+  for (let i = 0; i < w; i += 1) {
+    const idx = (cursor - i + len) % len
+    const raw = inferDensityFromRow(replay.rows[idx])
+    const norm = Math.max(0, Math.min(1, raw / replay.maxDensity))
+    sum += norm
+  }
+  return sum / w
+}
+
+function closestPlaceByCoords(lat, lon) {
+  let best = null
+  for (const p of PLACES) {
+    const d = haversineKm(lat, lon, p.lat, p.lon)
+    if (!best || d < best.distanceKm) best = { ...p, distanceKm: Number(d.toFixed(2)) }
+  }
+  return best
+}
+
+async function callGeoProvider(url, payload) {
+  if (!url) return null
+  try {
+    const headers = { 'Content-Type': 'application/json' }
+    if (GEO_API_KEY) headers.Authorization = `Bearer ${GEO_API_KEY}`
+    const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) })
+    if (!r.ok) return null
+    return await r.json()
+  } catch {
+    return null
+  }
+}
+
 const app = express()
 app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }))
 app.use(express.json())
+
+app.post('/api/ai/decision', (req, res) => {
+  const activeLaneIds = Array.isArray(req.body?.activeLaneIds)
+    ? req.body.activeLaneIds.map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 1 && x <= 9)
+    : []
+  const emergencyLane = Number(req.body?.emergencyLane)
+
+  const lanes = Array.from({ length: 9 }).map((_, idx) => {
+    const laneId = idx + 1
+    const replay = laneReplays[idx]
+    if (!replay || replay.rows.length === 0) {
+      return { id: laneId, congestionNorm: null, source: null }
+    }
+    const congestionNorm = laneCongestionAtCursor(replay, replayCursor)
+    return { id: laneId, congestionNorm, source: replay.name }
+  })
+
+  const candidates = lanes.filter((lane) => activeLaneIds.includes(lane.id) && lane.congestionNorm != null)
+  const rrLaneId = pickRoundRobinLane(candidates.map((c) => c.id))
+  let chosen = rrLaneId == null ? null : candidates.find((c) => c.id === rrLaneId) ?? null
+
+  if (Number.isInteger(emergencyLane) && activeLaneIds.includes(emergencyLane)) {
+    const forced = lanes.find((l) => l.id === emergencyLane && l.congestionNorm != null)
+    if (forced) chosen = forced
+  }
+
+  if (!chosen) {
+    replayCursor += 1
+    return res.json({
+      mode: 'ai',
+      greenLaneId: null,
+      greenTimeSec: 40,
+      reason: 'No active lanes with video/log data. waiting for signal',
+      thresholds: { empty: EMPTY_THRESHOLD, veryHigh: VERY_HIGH_THRESHOLD },
+      lanes,
+    })
+  }
+
+  const d = chosen.congestionNorm
+  const greenTimeSec = Number.isInteger(emergencyLane) && emergencyLane === chosen.id ? 90 : mapDurationFromCongestion(d)
+  const level =
+    d <= EMPTY_THRESHOLD ? 'empty' : d >= VERY_HIGH_THRESHOLD ? 'very_high' : 'medium'
+  const reasonPrefix = Number.isInteger(emergencyLane) && emergencyLane === chosen.id
+    ? `Emergency override for Lane ${chosen.id}.`
+    : `Round robin selected Lane ${chosen.id}.`
+  const reason =
+    level === 'very_high'
+      ? `${reasonPrefix} Very high congestion (${d.toFixed(2)}), assigning max green time`
+      : level === 'empty'
+        ? `${reasonPrefix} Near empty (${d.toFixed(2)}), assigning minimum green time`
+        : `${reasonPrefix} Medium congestion (${d.toFixed(2)}), assigning adaptive green time`
+
+  lastServedLaneId = chosen.id
+  replayCursor += 1
+  return res.json({
+    mode: 'ai',
+    greenLaneId: chosen.id,
+    greenTimeSec,
+    reason,
+    thresholds: { empty: EMPTY_THRESHOLD, veryHigh: VERY_HIGH_THRESHOLD },
+    lanes,
+  })
+})
 
 app.post('/api/auth/register', (req, res) => {
   const { email, password, name } = req.body || {}
@@ -283,36 +460,87 @@ app.post('/api/users/me/routes', authMiddleware, (req, res) => {
 })
 
 app.post('/api/routes/plan', (req, res) => {
-  const { source, destination } = req.body || {}
-  if (!source?.trim() || !destination?.trim()) {
+  const { source, destination, sourceCoords, destinationCoords } = req.body || {}
+  const s = String(source || '').trim()
+  const d = String(destination || '').trim()
+  const srcCoords =
+    sourceCoords && Number.isFinite(Number(sourceCoords.lat)) && Number.isFinite(Number(sourceCoords.lon))
+      ? { lat: Number(sourceCoords.lat), lon: Number(sourceCoords.lon) }
+      : null
+  const dstCoords =
+    destinationCoords && Number.isFinite(Number(destinationCoords.lat)) && Number.isFinite(Number(destinationCoords.lon))
+      ? { lat: Number(destinationCoords.lat), lon: Number(destinationCoords.lon) }
+      : null
+  if ((!s && !srcCoords) || (!d && !dstCoords)) {
     return res.status(400).json({ error: 'Source and destination are required' })
   }
-  const s = source.trim()
-  const d = destination.trim()
-  const planned = planRoutes(s, d, 3)
-  if (!planned.ok) {
-    return res.status(400).json({
-      error: planned.error,
-      knownPlaces: planned.knownPlaces,
+  const providerResultPromise = callGeoProvider(GEO_ROUTE_API_URL, {
+    source: s,
+    destination: d,
+    sourceCoords: srcCoords,
+    destinationCoords: dstCoords,
+    maxRoutes: 3,
+  })
+  providerResultPromise.then((providerResult) => {
+    if (providerResult?.ok && Array.isArray(providerResult.routes)) {
+      return res.json(providerResult)
+    }
+    const resolvedSource = srcCoords ? closestPlaceByCoords(srcCoords.lat, srcCoords.lon)?.names?.[0] || s : s
+    const resolvedDest = dstCoords ? closestPlaceByCoords(dstCoords.lat, dstCoords.lon)?.names?.[0] || d : d
+    const planned = planRoutes(resolvedSource, resolvedDest, 3)
+    if (!planned.ok) {
+      return res.status(400).json({
+        error: planned.error,
+        knownPlaces: planned.knownPlaces,
+      })
+    }
+    const routes = planned.routes.map((r) => ({ ...r, mapUrl: null, mapEmbedUrl: null }))
+    return res.json({
+      source: planned.source,
+      destination: planned.destination,
+      routes,
+      provider: 'demo-fallback',
     })
-  }
-  res.json({
-    source: planned.source,
-    destination: planned.destination,
-    routes: planned.routes,
   })
 })
 
 app.post('/api/parking/nearby', authMiddleware, (req, res) => {
-  const { location } = req.body || {}
-  if (!location?.trim()) {
-    return res.status(400).json({ error: 'location is required' })
+  const { location, coords } = req.body || {}
+  const hasCoords = coords && Number.isFinite(Number(coords.lat)) && Number.isFinite(Number(coords.lon))
+  if (!location?.trim() && !hasCoords) {
+    return res.status(400).json({ error: 'location or coords is required' })
   }
-  const result = parkingNearLocation(location.trim())
-  if (!result.ok) {
-    return res.status(400).json({ error: result.error, knownPlaces: result.knownPlaces })
+  const payload = {
+    location: String(location || '').trim(),
+    coords: hasCoords ? { lat: Number(coords.lat), lon: Number(coords.lon) } : null,
   }
-  res.json(result)
+  callGeoProvider(GEO_PARKING_API_URL, payload).then((providerResult) => {
+    if (providerResult?.ok && Array.isArray(providerResult.zones)) {
+      return res.json(providerResult)
+    }
+    if (hasCoords) {
+      const center = closestPlaceByCoords(Number(coords.lat), Number(coords.lon))
+      const zones = PARKING_ZONES.map((z) => ({
+        ...z,
+        distanceKm: Number(haversineKm(center.lat, center.lon, z.lat, z.lon).toFixed(2)),
+      }))
+        .filter((z) => z.distanceKm <= 1)
+        .sort((a, b) => a.distanceKm - b.distanceKm)
+      return res.json({
+        ok: true,
+        location: center.names[0],
+        radiusKm: 1,
+        center: { lat: center.lat, lon: center.lon },
+        zones,
+        provider: 'demo-fallback',
+      })
+    }
+    const result = parkingNearLocation(String(location).trim())
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error, knownPlaces: result.knownPlaces })
+    }
+    return res.json({ ...result, provider: 'demo-fallback' })
+  })
 })
 
 app.get('/api/admin/intersections', authMiddleware, authorityMiddleware, (_req, res) => {

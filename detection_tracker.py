@@ -7,7 +7,8 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from collections import defaultdict
 
 # -------------------- CONFIG --------------------
-VIDEO_FOLDER = "videos"         # folder containing all mp4 videos
+# Use project-relative path to avoid Windows backslash escape issues.
+VIDEO_FOLDER = os.path.join(os.path.dirname(__file__), "traffic-web", "public", "videos")  # folder containing all mp4 videos
 OUTPUT_DIR = "logs"             # folder to save CSV logs
 MODEL_WEIGHTS = "yolov8n.pt"    # YOLO model
 VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}

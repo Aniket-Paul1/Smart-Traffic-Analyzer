@@ -8,6 +8,7 @@ const fuelRoutes = [
 
 export default function AdditionalFeaturesPanel() {
   const [location, setLocation] = useState('')
+  const [coords, setCoords] = useState(null)
   const [zones, setZones] = useState([])
   const [resolvedName, setResolvedName] = useState('')
   const [loading, setLoading] = useState(false)
@@ -19,16 +20,18 @@ export default function AdditionalFeaturesPanel() {
     setErr('')
     setHints([])
     if (!location.trim()) {
-      setErr('Enter a location name.')
-      setZones([])
-      setResolvedName('')
-      return
+      if (!coords) {
+        setErr('Enter a location name or use current location.')
+        setZones([])
+        setResolvedName('')
+        return
+      }
     }
     setLoading(true)
     try {
       const data = await apiJson('/api/parking/nearby', {
         method: 'POST',
-        body: JSON.stringify({ location: location.trim() }),
+        body: JSON.stringify({ location: location.trim(), coords }),
       })
       setResolvedName(data.location || '')
       setZones(data.zones || [])
@@ -45,6 +48,26 @@ export default function AdditionalFeaturesPanel() {
     }
   }
 
+  function useCurrentLocation() {
+    setErr('')
+    if (!navigator.geolocation) {
+      setErr('Geolocation is not available in this browser.')
+      return
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const next = {
+          lat: Number(pos.coords.latitude.toFixed(6)),
+          lon: Number(pos.coords.longitude.toFixed(6)),
+        }
+        setCoords(next)
+        setLocation(`Current Location (${next.lat}, ${next.lon})`)
+      },
+      (err) => setErr(err.message || 'Could not fetch your current location.'),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
+    )
+  }
+
   return (
     <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
       <h2 className="mb-3 text-lg font-semibold">Additional Features</h2>
@@ -52,15 +75,25 @@ export default function AdditionalFeaturesPanel() {
         <div>
           <p className="mb-2 text-sm font-medium text-slate-300">Parking near a location</p>
           <p className="mb-2 text-xs text-slate-500">
-            Type a known place name (e.g. Sector 12, Tech Park, Downtown). We list parking zones within 1 km.
+            Type a known place name or use your current location. We list parking zones within 1 km.
           </p>
           <form onSubmit={searchParking} className="flex flex-wrap gap-2">
             <input
               value={location}
-              onChange={(e) => setLocation(e.target.value)}
+              onChange={(e) => {
+                setLocation(e.target.value)
+                setCoords(null)
+              }}
               placeholder="Location name"
               className="min-w-[160px] flex-1 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-100"
             />
+            <button
+              type="button"
+              onClick={useCurrentLocation}
+              className="rounded-lg border border-slate-600 px-3 py-1.5 text-sm text-cyan-300"
+            >
+              Use current location
+            </button>
             <button
               type="submit"
               disabled={loading}

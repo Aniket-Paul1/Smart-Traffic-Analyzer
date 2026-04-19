@@ -11,6 +11,8 @@ export default function RoutePlannerPage() {
   const { user } = useAuth()
   const [source, setSource] = useState('Sector 12')
   const [destination, setDestination] = useState('Tech Park')
+  const [sourceCoords, setSourceCoords] = useState(null)
+  const [destinationCoords, setDestinationCoords] = useState(null)
   const [routes, setRoutes] = useState([])
   const [meta, setMeta] = useState({ source: '', destination: '' })
   const [loading, setLoading] = useState(false)
@@ -27,7 +29,7 @@ export default function RoutePlannerPage() {
       const data = await apiJson('/api/routes/plan', {
         skipAuth: true,
         method: 'POST',
-        body: JSON.stringify({ source, destination }),
+        body: JSON.stringify({ source, destination, sourceCoords, destinationCoords }),
       })
       setMeta({ source: data.source || source, destination: data.destination || destination })
       setRoutes(data.routes || [])
@@ -43,6 +45,28 @@ export default function RoutePlannerPage() {
     } finally {
       setLoading(false)
     }
+  }
+
+  function useCurrentLocation(setter, setText, label) {
+    setError('')
+    if (!navigator.geolocation) {
+      setError('Geolocation is not available in this browser.')
+      return
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const coords = {
+          lat: Number(pos.coords.latitude.toFixed(6)),
+          lon: Number(pos.coords.longitude.toFixed(6)),
+        }
+        setter(coords)
+        setText(`${label} (${coords.lat}, ${coords.lon})`)
+      },
+      (err) => {
+        setError(err.message || 'Could not fetch your current location.')
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
+    )
   }
 
   async function saveFastest() {
@@ -70,25 +94,44 @@ export default function RoutePlannerPage() {
       <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
         <h2 className="mb-3 text-lg font-semibold">Smart Route Planner</h2>
         <p className="mb-3 text-sm text-slate-400">
-          Enter place names from the demo city catalog. You will get up to three different path options (when the network allows),
-          with a map preview and a link to full directions.
+          Enter source and destination, or use your current location. Route planning now supports external geolocation provider APIs.
         </p>
         <div className="grid gap-3 md:grid-cols-2">
           <label className="block text-xs text-slate-400">
             Source
             <input
               value={source}
-              onChange={(e) => setSource(e.target.value)}
+              onChange={(e) => {
+                setSource(e.target.value)
+                setSourceCoords(null)
+              }}
               className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 p-2 text-slate-100"
             />
+            <button
+              type="button"
+              onClick={() => useCurrentLocation(setSourceCoords, setSource, 'Current Location')}
+              className="mt-2 rounded-md border border-slate-700 px-2 py-1 text-[11px] text-cyan-300 hover:bg-slate-800"
+            >
+              Use current location
+            </button>
           </label>
           <label className="block text-xs text-slate-400">
             Destination
             <input
               value={destination}
-              onChange={(e) => setDestination(e.target.value)}
+              onChange={(e) => {
+                setDestination(e.target.value)
+                setDestinationCoords(null)
+              }}
               className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 p-2 text-slate-100"
             />
+            <button
+              type="button"
+              onClick={() => useCurrentLocation(setDestinationCoords, setDestination, 'Current Location')}
+              className="mt-2 rounded-md border border-slate-700 px-2 py-1 text-[11px] text-cyan-300 hover:bg-slate-800"
+            >
+              Use current location
+            </button>
           </label>
         </div>
         <div className="mt-3 flex flex-wrap gap-2">
@@ -143,7 +186,7 @@ export default function RoutePlannerPage() {
                   rel="noopener noreferrer"
                   className="mt-2 inline-block text-cyan-400 underline hover:text-cyan-300"
                 >
-                  Open turn-by-turn in OpenStreetMap
+                  Open route in provider map
                 </a>
               )}
             </div>
