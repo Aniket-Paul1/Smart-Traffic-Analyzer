@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
-import { apiJson } from './AuthContext'
+import { apiJson, useAuth } from './AuthContext'
 
 const TrafficContext = createContext(null)
 
@@ -10,10 +10,6 @@ const densityMeta = (value) => {
   return { label: 'High', color: 'text-rose-300', bg: 'bg-rose-500/20' }
 }
 
-/** Comma-separated list of up to 9 recorded video URLs (lane 1 … lane 9).
- *  Empty slots mean "no lane / no footage" (card shows NULL).
- *  Set `VITE_CAMERA_URLS` in `.env` (kept for backwards compatibility).
- */
 function cameraUrlsFromEnv() {
   const raw = import.meta.env.VITE_CAMERA_URLS
   if (typeof raw !== 'string' || !raw.trim()) return Array(9).fill('')
@@ -22,38 +18,50 @@ function cameraUrlsFromEnv() {
   return parts.slice(0, 9)
 }
 
+function labelFromSource(streamUrl, laneId) {
+  if (!streamUrl) return 'NULL'
+  const clean = streamUrl.split('?')[0]
+  const parts = clean.split('/').filter(Boolean)
+  return parts[parts.length - 1] || `Lane ${laneId}`
+}
+
 function buildInitialLanes() {
   const urls = cameraUrlsFromEnv()
   const firstVideoLane = urls.findIndex((u) => Boolean(u && u.length > 0)) + 1
   return Array.from({ length: 9 }).map((_, i) => {
-    const u = urls[i]
-    const streamUrl = u && u.length > 0 ? u : null
+    const source = urls[i]
+    const streamUrl = source && source.length > 0 ? source : null
     return {
       id: i + 1,
       name: `Lane ${i + 1}`,
       density: 0,
       congestion: 0,
       queueLength: 0,
+      vehicleCount: 0,
+      avgSpeedKmh: 0,
+      available: Boolean(streamUrl),
+      sourceError: '',
       status: firstVideoLane > 0 && i + 1 === firstVideoLane ? 'GREEN' : 'RED',
       timer: 0,
-      videoLabel: streamUrl ? `Video ${i + 1}` : 'NULL',
+      videoLabel: labelFromSource(streamUrl, i + 1),
       streamUrl,
     }
   })
 }
 
 export function TrafficProvider({ children }) {
+  const { user, canAccessAuthority } = useAuth()
   const [lanes, setLanes] = useState(() => buildInitialLanes())
   const [simulationRunning, setSimulationRunning] = useState(true)
   const [simulationSpeed, setSimulationSpeed] = useState(1)
   const [currentGreenLane, setCurrentGreenLane] = useState(() => {
-    const first = buildInitialLanes().find((l) => l.streamUrl)
+    const first = buildInitialLanes().find((lane) => lane.streamUrl)
     return first?.id ?? null
   })
   const [aiMode, setAiMode] = useState(true)
   const [manualLane, setManualLane] = useState(1)
   const [manualDuration, setManualDuration] = useState(55)
-  const [aiReason, setAiReason] = useState('AI decisions are based on detected congestion from recorded video lanes')
+  const [aiReason, setAiReason] = useState('AI decisions are based on pseudo-live congestion from the configured lane videos')
   const [emergencyLane, setEmergencyLane] = useState(null)
   const [alerts, setAlerts] = useState([
     { id: 1, type: 'Heavy Traffic', message: 'Lane 4 is reaching congestion threshold.', level: 'warning' },
@@ -65,7 +73,6 @@ export function TrafficProvider({ children }) {
     fixedThroughput: 74,
     aiThroughput: 112,
   })
-
   const [densitySeries, setDensitySeries] = useState([])
   const [predictionSeries, setPredictionSeries] = useState([])
   const [rlTrainingSeries, setRlTrainingSeries] = useState(
@@ -75,20 +82,23 @@ export function TrafficProvider({ children }) {
   const lanesRef = useRef(lanes)
   const currentGreenRef = useRef(currentGreenLane)
 
-  const averageWait = useMemo(
-    () => {
-      const source = lanes.filter((lane) => Boolean(lane.streamUrl))
-      if (source.length === 0) return 0
-      return Number((source.reduce((acc, lane) => acc + lane.queueLength * (lane.density + 0.3), 0) / source.length).toFixed(1))
-    },
-    [lanes],
-  )
+  const averageWait = useMemo(() => {
+    const source = lanes.filter((lane) => Boolean(lane.streamUrl))
+    if (source.length === 0) return 0
+    return Number(
+      (
+        source.reduce((acc, lane) => acc + lane.queueLength * (lane.density + 0.3), 0) /
+        source.length
+      ).toFixed(1),
+    )
+  }, [lanes])
 
   const peakLane = useMemo(() => {
     const source = lanes.filter((lane) => Boolean(lane.streamUrl))
     if (source.length === 0) return lanes[0]
     return source.reduce((a, b) => (a.density > b.density ? a : b), source[0])
   }, [lanes])
+
   const activeLanes = useMemo(() => lanes.filter((lane) => Boolean(lane.streamUrl)), [lanes])
 
   useEffect(() => {
@@ -100,7 +110,8 @@ export function TrafficProvider({ children }) {
   }, [currentGreenLane])
 
   useEffect(() => {
-    if (!simulationRunning) return
+    if (!simulationRunning || !user) return
+
     const interval = setInterval(async () => {
       setLanes((prev) =>
         prev.map((lane) => ({
@@ -112,22 +123,26 @@ export function TrafficProvider({ children }) {
       if (inFlightRef.current) return
       const liveLanes = lanesRef.current
       const liveGreen = currentGreenRef.current
-      const active = liveLanes.find((l) => l.id === liveGreen)
-      if (active && active.status === 'GREEN' && active.timer > 0) return
+      const activeLane = liveLanes.find((lane) => lane.id === liveGreen)
+      if (activeLane && activeLane.status === 'GREEN' && activeLane.timer > 0) return
 
       inFlightRef.current = true
       try {
-        const activeLaneIds = liveLanes.filter((l) => Boolean(l.streamUrl)).map((l) => l.id)
+        const activeLaneIds = liveLanes.filter((lane) => Boolean(lane.streamUrl)).map((lane) => lane.id)
         if (activeLaneIds.length === 0) {
           setAiReason('No lane videos configured. waiting for signal')
           setLanes((prev) =>
             prev.map((lane) => ({
               ...lane,
+              available: false,
+              sourceError: '',
               status: 'RED',
               timer: 0,
               density: 0,
               congestion: 0,
               queueLength: 0,
+              vehicleCount: 0,
+              avgSpeedKmh: 0,
             })),
           )
           return
@@ -149,9 +164,12 @@ export function TrafficProvider({ children }) {
         }
 
         const data = await apiJson('/api/ai/decision', {
-          skipAuth: true,
           method: 'POST',
-          body: JSON.stringify({ activeLaneIds, emergencyLane }),
+          body: JSON.stringify({
+            activeLaneIds,
+            emergencyLane: canAccessAuthority ? emergencyLane : null,
+            currentGreenLane: liveGreen,
+          }),
         })
 
         const selected = Number(data.greenLaneId)
@@ -160,28 +178,32 @@ export function TrafficProvider({ children }) {
         setAiReason(String(data.reason || 'AI decision applied'))
         setLanes((prev) =>
           prev.map((lane) => {
-            const aiLane = Array.isArray(data.lanes) ? data.lanes.find((x) => Number(x.id) === lane.id) : null
-            const d = aiLane?.congestionNorm
-            const density = typeof d === 'number' ? Math.max(0, Math.min(1, d)) : 0
+            const aiLane = Array.isArray(data.lanes) ? data.lanes.find((row) => Number(row.id) === lane.id) : null
+            const densityRaw = aiLane?.congestionNorm
+            const density = typeof densityRaw === 'number' ? Math.max(0, Math.min(1, densityRaw)) : 0
             return {
               ...lane,
+              available: Boolean(aiLane?.available ?? lane.streamUrl),
+              sourceError: aiLane?.error || '',
               density,
               congestion: Math.round(density * 100),
               queueLength: Math.round(density * 30),
+              vehicleCount: Number(aiLane?.vehicleCount || 0),
+              avgSpeedKmh: Number(aiLane?.avgSpeedKmh || 0),
               status: lane.id === selected ? 'GREEN' : 'RED',
               timer: lane.id === selected ? greenTime : 0,
             }
           }),
         )
-      } catch (e) {
-        setAiReason(`AI backend unavailable: ${e?.message || 'unknown error'}`)
+      } catch (error) {
+        setAiReason(`AI backend unavailable: ${error?.message || 'unknown error'}`)
       } finally {
         inFlightRef.current = false
       }
     }, Math.max(250, 1000 / simulationSpeed))
 
     return () => clearInterval(interval)
-  }, [simulationRunning, simulationSpeed, aiMode, manualLane, manualDuration, emergencyLane])
+  }, [simulationRunning, simulationSpeed, aiMode, manualLane, manualDuration, emergencyLane, user, canAccessAuthority])
 
   useEffect(() => {
     const stamp = new Date().toLocaleTimeString()
@@ -230,8 +252,9 @@ export function TrafficProvider({ children }) {
     rlTrainingSeries,
     setRlTrainingSeries,
     resetSimulation: () => {
-      setLanes(buildInitialLanes())
-      const first = buildInitialLanes().find((l) => l.streamUrl)
+      const initial = buildInitialLanes()
+      setLanes(initial)
+      const first = initial.find((lane) => lane.streamUrl)
       setCurrentGreenLane(first?.id ?? null)
       setEmergencyLane(null)
     },

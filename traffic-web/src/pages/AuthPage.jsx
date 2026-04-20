@@ -140,13 +140,6 @@ export default function AuthPage() {
           </button>
         </form>
       </section>
-
-      <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 lg:col-span-2">
-        <h3 className="mb-2 text-md font-semibold">Saved routes</h3>
-        <p className="text-sm text-slate-400">
-          After you sign in, save and review trips from the <span className="text-slate-300">Route Planner</span> page.
-        </p>
-      </section>
     </div>
   )
 }

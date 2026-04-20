@@ -18,20 +18,21 @@ export default function LaneCard({ lane }) {
   const { densityMeta } = useTraffic()
   const density = densityMeta(lane.density)
   const isGreen = lane.status === 'GREEN'
-  const [feedFailed, setFeedFailed] = useState(false)
+  const [failedSource, setFailedSource] = useState(null)
   const streamSrc = lane.streamUrl?.trim() ? lane.streamUrl.trim() : null
+  const feedFailed = failedSource === streamSrc
   const hasVideo = Boolean(streamSrc)
   const videoRef = useRef(null)
 
   useEffect(() => {
     const el = videoRef.current
-    if (!el) return
-    if (!hasVideo) return
-    if (feedFailed) return
+    if (!el || !hasVideo || feedFailed) return
 
     if (isGreen) {
-      const p = el.play()
-      if (p && typeof p.catch === 'function') p.catch(() => {})
+      const playPromise = el.play()
+      if (playPromise && typeof playPromise.catch === 'function') {
+        playPromise.catch(() => {})
+      }
     } else {
       el.pause()
     }
@@ -43,6 +44,7 @@ export default function LaneCard({ lane }) {
         <h3 className="text-sm font-medium text-slate-100">{lane.name}</h3>
         <span className="text-xs text-slate-400">{lane.videoLabel}</span>
       </div>
+
       <div className="relative mb-3 h-24 overflow-hidden rounded-lg bg-slate-800">
         {hasVideo && !feedFailed && (
           <video
@@ -54,7 +56,7 @@ export default function LaneCard({ lane }) {
             playsInline
             loop
             preload="metadata"
-            onError={() => setFeedFailed(true)}
+            onError={() => setFailedSource(streamSrc)}
           />
         )}
         {hasVideo && feedFailed && (
@@ -77,7 +79,14 @@ export default function LaneCard({ lane }) {
           {!hasVideo ? 'waiting for signal' : isGreen ? 'Vehicle flow active' : 'Queued at signal'}
         </div>
       </div>
-      <p className="mb-2 text-[10px] leading-tight text-slate-500">{!hasVideo ? 'Lane not configured in this intersection.' : 'Countdown & density are simulated (not computed from pixels).'}</p>
+
+      <p className="mb-2 text-[10px] leading-tight text-slate-500">
+        {!hasVideo
+          ? 'Lane not configured in this intersection.'
+          : lane.sourceError
+            ? lane.sourceError
+            : 'Congestion is computed from pseudo-live object detection on this lane video.'}
+      </p>
 
       <div className="mb-2 flex items-center justify-between text-xs">
         <div className="flex items-center gap-1.5">
@@ -92,6 +101,14 @@ export default function LaneCard({ lane }) {
       <div className="mb-2 flex items-center justify-between text-xs text-slate-300">
         <span>Countdown</span>
         <span className="font-semibold text-cyan-300">{lane.timer}s</span>
+      </div>
+      <div className="mb-2 flex items-center justify-between text-xs text-slate-300">
+        <span>Vehicles</span>
+        <span className="font-semibold text-slate-100">{lane.vehicleCount}</span>
+      </div>
+      <div className="mb-2 flex items-center justify-between text-xs text-slate-300">
+        <span>Avg Speed</span>
+        <span className="font-semibold text-slate-100">{lane.avgSpeedKmh.toFixed(1)} km/h</span>
       </div>
       <div className="mb-1 h-2 rounded-full bg-slate-800">
         <div className={clsx('h-full rounded-full', density.bg)} style={{ width: `${Math.min(100, lane.density * 100)}%` }} />

@@ -23,7 +23,7 @@ export default function AIDecisionPanel() {
           className={`rounded-lg px-3 py-2 text-sm ${aiMode ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
           onClick={() => setAiMode(true)}
         >
-          AI Mode (RL)
+          AI Mode (Pseudo-Live)
         </button>
         <button
           className={`rounded-lg px-3 py-2 text-sm ${!aiMode ? 'bg-amber-500 text-slate-950' : 'bg-slate-800 text-slate-300'}`}

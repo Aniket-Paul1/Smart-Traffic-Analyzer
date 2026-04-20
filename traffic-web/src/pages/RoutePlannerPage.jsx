@@ -47,7 +47,7 @@ export default function RoutePlannerPage() {
     }
   }
 
-  function useCurrentLocation(setter, setText, label) {
+  function requestCurrentLocation(setter, setText, label) {
     setError('')
     if (!navigator.geolocation) {
       setError('Geolocation is not available in this browser.')
@@ -109,7 +109,7 @@ export default function RoutePlannerPage() {
             />
             <button
               type="button"
-              onClick={() => useCurrentLocation(setSourceCoords, setSource, 'Current Location')}
+              onClick={() => requestCurrentLocation(setSourceCoords, setSource, 'Current Location')}
               className="mt-2 rounded-md border border-slate-700 px-2 py-1 text-[11px] text-cyan-300 hover:bg-slate-800"
             >
               Use current location
@@ -127,7 +127,7 @@ export default function RoutePlannerPage() {
             />
             <button
               type="button"
-              onClick={() => useCurrentLocation(setDestinationCoords, setDestination, 'Current Location')}
+              onClick={() => requestCurrentLocation(setDestinationCoords, setDestination, 'Current Location')}
               className="mt-2 rounded-md border border-slate-700 px-2 py-1 text-[11px] text-cyan-300 hover:bg-slate-800"
             >
               Use current location

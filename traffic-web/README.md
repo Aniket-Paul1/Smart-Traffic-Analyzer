@@ -1,16 +1,52 @@
-# React + Vite
+# Smart Traffic Web Console
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This web app is the operator dashboard for the traffic project.
 
-Currently, two official plugins are available:
+## What changed
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Lane decisions now come from **pseudo-live video analysis** instead of pre-generated CSV replay logs.
+- The backend reads the same `VITE_CAMERA_URLS` lane list that the frontend uses.
+- A Python analyzer (`pseudo_live_detection_service.py`) reads the configured videos/streams directly, runs YOLO lane analysis, and writes shared live state for the Node API.
+- Route planning and parking lookup can now use your own map/geolocation provider through `.env`.
 
-## React Compiler
+## Prerequisites
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- Node.js 20+ recommended
+- Python 3.10+ available on PATH, or set `PYTHON_BIN` in `traffic-web/.env`
+- Python packages from the root `requirements.txt`
 
-## Expanding the ESLint configuration
+## Configure
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+Edit [traffic-web/.env](C:/Users/ANIKET/OneDrive/Desktop/Adi/a_traffic/traffic-web/.env):
+
+- `VITE_CAMERA_URLS`: up to 9 local files or stream URLs
+- `JWT_SECRET`: long random secret for auth
+- `ADMIN_BOOTSTRAP_EMAIL`: optional first admin email
+- `GEO_ROUTE_API_URL`, `GEO_PARKING_API_URL`, `GEO_API_KEY`: optional external map provider
+- `PSEUDO_LIVE_*`: analyzer tuning
+
+Use [traffic-web/.env.example](C:/Users/ANIKET/OneDrive/Desktop/Adi/a_traffic/traffic-web/.env.example) as a template for new setups.
+
+## Run
+
+From `traffic-web`:
+
+```bash
+npm run server
+```
+
+This starts the Node API and attempts to auto-start the Python pseudo-live analyzer.
+
+In another terminal:
+
+```bash
+npm run dev
+```
+
+Open the Vite app, sign up or log in, and the dashboard will begin polling pseudo-live lane state.
+
+## Notes
+
+- If Python is missing, the API will still start, but live lane decisions will stay in a warming-up state until the analyzer can run.
+- If you use local files, longer videos reduce visible looping in pseudo-live playback.
+- The route planner and parking modules fall back to demo data when no external provider URL is configured.
