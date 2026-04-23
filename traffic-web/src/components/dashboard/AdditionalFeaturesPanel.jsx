@@ -6,6 +6,8 @@ export default function AdditionalFeaturesPanel() {
   const [coords, setCoords] = useState(null)
   const [zones, setZones] = useState([])
   const [resolvedName, setResolvedName] = useState('')
+  const [previewTitle, setPreviewTitle] = useState('')
+  const [previewUrl, setPreviewUrl] = useState('')
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
   const [hints, setHints] = useState([])
@@ -18,6 +20,8 @@ export default function AdditionalFeaturesPanel() {
       setErr('Enter a location name or use current location.')
       setZones([])
       setResolvedName('')
+      setPreviewTitle('')
+      setPreviewUrl('')
       return
     }
     setLoading(true)
@@ -27,13 +31,23 @@ export default function AdditionalFeaturesPanel() {
         body: JSON.stringify({ location: location.trim(), coords }),
       })
       setResolvedName(data.location || '')
-      setZones(data.zones || [])
-      if (!data.zones?.length) {
+      const nextZones = data.zones || []
+      setZones(nextZones)
+      if (nextZones[0]?.mapEmbedUrl) {
+        setPreviewTitle(nextZones[0].name || 'Parking preview')
+        setPreviewUrl(nextZones[0].mapEmbedUrl)
+      } else {
+        setPreviewTitle('')
+        setPreviewUrl('')
+      }
+      if (!nextZones.length) {
         setErr(`No parking zones were found within ${data.radiusKm ?? 1} km of that location.`)
       }
     } catch (error) {
       setZones([])
       setResolvedName('')
+      setPreviewTitle('')
+      setPreviewUrl('')
       setErr(error.message || 'Lookup failed')
       if (error.knownPlaces?.length) setHints(error.knownPlaces)
     } finally {
@@ -110,6 +124,18 @@ export default function AdditionalFeaturesPanel() {
               <span className="text-slate-400"> | {zone.distanceKm} km | Slots: {zone.slots} | </span>
               <span>{zone.availability}</span>
               {zone.address ? <div className="mt-1 text-slate-500">{zone.address}</div> : null}
+              {zone.mapEmbedUrl ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPreviewTitle(zone.name || 'Parking preview')
+                    setPreviewUrl(zone.mapEmbedUrl)
+                  }}
+                  className="mt-1 mr-3 inline-block text-cyan-400 underline hover:text-cyan-300"
+                >
+                  Quick preview
+                </button>
+              ) : null}
               {zone.mapUrl ? (
                 <a
                   href={zone.mapUrl}
@@ -123,6 +149,20 @@ export default function AdditionalFeaturesPanel() {
             </div>
           ))}
         </div>
+        {previewUrl && (
+          <div className="mt-4 overflow-hidden rounded-xl border border-slate-700 bg-slate-950/80">
+            <div className="border-b border-slate-800 px-3 py-2 text-xs text-slate-300">
+              Fast map preview: <span className="text-slate-100">{previewTitle}</span>
+            </div>
+            <iframe
+              title={previewTitle || 'Parking preview'}
+              className="h-64 w-full border-0 bg-slate-900"
+              loading="lazy"
+              referrerPolicy="no-referrer-when-downgrade"
+              src={previewUrl}
+            />
+          </div>
+        )}
       </div>
     </section>
   )

@@ -55,6 +55,7 @@ const PSEUDO_LIVE_STALE_MS = Number(process.env.PSEUDO_LIVE_STALE_MS || 8000)
 const GOOGLE_GEOCODE_URL = 'https://maps.googleapis.com/maps/api/geocode/json'
 const GOOGLE_ROUTES_COMPUTE_URL = 'https://routes.googleapis.com/directions/v2:computeRoutes'
 const GOOGLE_PLACES_NEARBY_URL = 'https://places.googleapis.com/v1/places:searchNearby'
+const GOOGLE_MAPS_EMBED_BASE = 'https://www.google.com/maps/embed/v1'
 
 if (!JWT_SECRET) {
   throw new Error('Missing JWT_SECRET. Set it in traffic-web/.env before starting the server.')
@@ -524,6 +525,21 @@ function buildGoogleMapsDirUrl(origin, destination) {
   return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&travelmode=driving`
 }
 
+function buildGoogleMapsSearchUrl(query) {
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`
+}
+
+function buildGoogleMapsEmbedUrl(mode, params) {
+  if (!GEO_API_KEY) return null
+  const url = new URL(`${GOOGLE_MAPS_EMBED_BASE}/${mode}`)
+  url.searchParams.set('key', GEO_API_KEY)
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value == null || value === '') continue
+    url.searchParams.set(key, String(value))
+  }
+  return url.toString()
+}
+
 function routeConditionFromDurations(baseDurationSec, trafficDurationSec) {
   if (!Number.isFinite(baseDurationSec) || baseDurationSec <= 0 || !Number.isFinite(trafficDurationSec)) return 'Moderate'
   const ratio = trafficDurationSec / baseDurationSec
@@ -641,7 +657,11 @@ async function googlePlanRoutes({ source, destination, sourceCoords, destination
       condition,
       fuelNote: routeFuelNote(condition, idx),
       mapUrl: buildGoogleMapsDirUrl(mapOrigin, mapDestination),
-      mapEmbedUrl: null,
+      mapEmbedUrl: buildGoogleMapsEmbedUrl('directions', {
+        origin: mapOrigin,
+        destination: mapDestination,
+        mode: 'driving',
+      }),
       distanceKm: Number.isFinite(Number(route.distanceMeters))
         ? Number((Number(route.distanceMeters) / 1000).toFixed(1))
         : null,
@@ -713,7 +733,10 @@ async function googleNearbyParking({ location, coords }) {
         slots: 'Unknown',
         availability: place.primaryTypeDisplayName?.text || 'Live place result',
         address: place.formattedAddress || '',
-        mapUrl: place.googleMapsUri || null,
+        mapUrl: buildGoogleMapsSearchUrl(place.formattedAddress || `${lat},${lon}`),
+        mapEmbedUrl: buildGoogleMapsEmbedUrl('place', {
+          q: place.formattedAddress || `${lat},${lon}`,
+        }),
       }
     })
     .sort((a, b) => a.distanceKm - b.distanceKm)

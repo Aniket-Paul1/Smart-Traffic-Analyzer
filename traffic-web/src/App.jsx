@@ -1,5 +1,5 @@
 import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom'
-import { CarFront, LayoutDashboard, LogOut, MessageSquareWarning, Shield, UserRound, Users } from 'lucide-react'
+import { CarFront, Home, LayoutDashboard, LogOut, MessageSquareWarning, Shield, UserRound, Users } from 'lucide-react'
 import { useAuth } from './context/AuthContext'
 import ProtectedRoute from './components/ProtectedRoute'
 import DashboardPage from './pages/DashboardPage'
@@ -8,29 +8,18 @@ import AdminPage from './pages/AdminPage'
 import AuthPage from './pages/AuthPage'
 import FeedbackPage from './pages/FeedbackPage'
 import UsersPage from './pages/UsersPage'
-
-function RootRedirect() {
-  const { user, loading } = useAuth()
-  if (loading) {
-    return (
-      <div className="flex min-h-[30vh] items-center justify-center text-sm text-slate-400">
-        Loading…
-      </div>
-    )
-  }
-  return <Navigate to={user ? '/dashboard' : '/auth'} replace />
-}
+import LandingPage from './pages/LandingPage'
 
 function CatchAllRedirect() {
   const { user, loading } = useAuth()
   if (loading) {
     return (
       <div className="flex min-h-[30vh] items-center justify-center text-sm text-slate-400">
-        Loading…
+        Loading...
       </div>
     )
   }
-  return <Navigate to={user ? '/dashboard' : '/auth'} replace />
+  return <Navigate to={user ? '/dashboard' : '/'} replace />
 }
 
 function App() {
@@ -45,12 +34,15 @@ function App() {
     ...(isAdmin ? [{ to: '/users', label: 'Users', icon: Users }] : []),
   ]
 
-  const guestNav = [{ to: '/auth', label: 'Login / Sign up', icon: UserRound }]
+  const guestNav = [
+    { to: '/', label: 'Home', icon: Home },
+    { to: '/auth', label: 'Login / Sign up', icon: UserRound },
+  ]
 
   const navItems = user ? authenticatedNav : guestNav
 
   const roleLabel = loading
-    ? 'Session…'
+    ? 'Session...'
     : !user
       ? 'Not signed in'
       : user.role === 'admin'
@@ -64,8 +56,8 @@ function App() {
       <header className="sticky top-0 z-40 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-4 py-4">
           <div>
-            <h1 className="text-xl font-semibold md:text-2xl">Smart Intelligent Traffic Management System</h1>
-            <p className="text-xs text-slate-400 md:text-sm">AI-driven control, prediction, analytics, and simulation</p>
+            <h1 className="text-xl font-semibold md:text-2xl">AI Based Traffic Management System</h1>
+            <p className="text-xs text-slate-400 md:text-sm">AI-driven control, analytics, routing, and emergency response</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <div className="rounded-lg border border-cyan-800/40 bg-cyan-900/20 px-3 py-1 text-xs text-cyan-300">
@@ -110,7 +102,7 @@ function App() {
 
       <main className="mx-auto max-w-7xl px-4 py-6">
         <Routes>
-          <Route path="/" element={<RootRedirect />} />
+          <Route path="/" element={<LandingPage />} />
           <Route path="/auth" element={<AuthPage />} />
           <Route
             path="/dashboard"
@@ -156,7 +148,7 @@ function App() {
         </Routes>
       </main>
       <footer className="border-t border-slate-800 bg-slate-900/60 px-4 py-4 text-center text-xs text-slate-400">
-        Smart City Control Console · React + Tailwind + Recharts
+        Smart City Control Console
       </footer>
     </div>
   )

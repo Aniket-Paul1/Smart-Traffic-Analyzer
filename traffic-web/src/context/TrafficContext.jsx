@@ -63,7 +63,6 @@ export function TrafficProvider({ children }) {
   const [emergencyLane, setEmergencyLane] = useState(null)
   const [alerts, setAlerts] = useState([
     { id: 1, type: 'Heavy Traffic', message: 'Lane 4 is reaching congestion threshold.', level: 'warning' },
-    { id: 2, type: 'Roadblock', message: 'Minor roadblock detected on Route B.', level: 'critical' },
   ])
   const [densitySeries, setDensitySeries] = useState([])
   const [predictionSeries, setPredictionSeries] = useState([])
