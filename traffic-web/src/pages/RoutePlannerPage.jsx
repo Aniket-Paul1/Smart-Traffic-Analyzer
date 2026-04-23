@@ -77,7 +77,7 @@ export default function RoutePlannerPage() {
       await apiJson('/api/users/me/routes', {
         method: 'POST',
         body: JSON.stringify({
-          label: `${meta.source || source} → ${meta.destination || destination}`,
+          label: `${meta.source || source} -> ${meta.destination || destination}`,
           source: meta.source || source,
           destination: meta.destination || destination,
           eta_mins: best.etaMins,
@@ -94,7 +94,7 @@ export default function RoutePlannerPage() {
       <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
         <h2 className="mb-3 text-lg font-semibold">Smart Route Planner</h2>
         <p className="mb-3 text-sm text-slate-400">
-          Enter source and destination, or use your current location. Route planning now supports external geolocation provider APIs.
+          Enter source and destination, or use your current location. Route planning supports external geolocation provider APIs.
         </p>
         <div className="grid gap-3 md:grid-cols-2">
           <label className="block text-xs text-slate-400">
@@ -141,7 +141,7 @@ export default function RoutePlannerPage() {
             disabled={loading}
             className="rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 disabled:opacity-50"
           >
-            {loading ? 'Planning…' : 'Find routes (up to 3)'}
+            {loading ? 'Planning...' : 'Find routes (up to 3)'}
           </button>
           {user && routes.length > 0 && (
             <button
@@ -157,7 +157,7 @@ export default function RoutePlannerPage() {
         {knownPlaces.length > 0 && (
           <p className="mt-2 text-xs text-slate-400">
             Example names you can use: {knownPlaces.slice(0, 12).join(', ')}
-            {knownPlaces.length > 12 ? '…' : ''}
+            {knownPlaces.length > 12 ? '...' : ''}
           </p>
         )}
         {saveMsg && <p className="mt-2 text-sm text-emerald-300">{saveMsg}</p>}
@@ -177,6 +177,7 @@ export default function RoutePlannerPage() {
               <p className="font-semibold text-slate-100">{route.label}</p>
               <p className="mt-1 text-slate-200">{route.path}</p>
               <p className="mt-1">Estimated time: ~{route.etaMins} min</p>
+              {typeof route.distanceKm === 'number' && <p>Distance: ~{route.distanceKm} km</p>}
               <p>Condition: {route.condition}</p>
               <p className="text-slate-400">{route.fuelNote}</p>
               {route.mapUrl && (

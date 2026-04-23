@@ -28,15 +28,11 @@ export default function LaneCard({ lane }) {
     const el = videoRef.current
     if (!el || !hasVideo || feedFailed) return
 
-    if (isGreen) {
-      const playPromise = el.play()
-      if (playPromise && typeof playPromise.catch === 'function') {
-        playPromise.catch(() => {})
-      }
-    } else {
-      el.pause()
+    const playPromise = el.play()
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(() => {})
     }
-  }, [isGreen, hasVideo, feedFailed])
+  }, [hasVideo, feedFailed, streamSrc])
 
   return (
     <article className="rounded-xl border border-slate-700 bg-slate-900 p-3 shadow-md">
@@ -73,7 +69,7 @@ export default function LaneCard({ lane }) {
         )}
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(34,211,238,0.15),transparent_70%)]" />
         <div className="absolute right-2 top-2 rounded bg-slate-950/70 px-2 py-0.5 text-[10px] text-slate-300">
-          {hasVideo ? (isGreen ? 'PLAYING' : 'PAUSED') : 'NO VIDEO'}
+          {hasVideo ? 'VIDEO LOOP' : 'NO VIDEO'}
         </div>
         <div className="absolute bottom-2 left-2 text-xs text-slate-200 drop-shadow-md">
           {!hasVideo ? 'waiting for signal' : isGreen ? 'Vehicle flow active' : 'Queued at signal'}

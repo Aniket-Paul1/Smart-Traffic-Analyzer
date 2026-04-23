@@ -33,7 +33,7 @@ function loadEnvFiles(paths) {
       const quoted =
         (valueRaw.startsWith('"') && valueRaw.endsWith('"')) ||
         (valueRaw.startsWith("'") && valueRaw.endsWith("'"))
-      process.env[key] = quoted ? valueRaw.slice(1, -1) : valueRaw
+      process.env[key] = quoted ? valueRaw.slice(1, -1) : valueRaw.trim()
     }
   }
 }
@@ -42,12 +42,12 @@ loadEnvFiles(DEFAULT_ENV_PATHS)
 
 const JWT_SECRET = process.env.JWT_SECRET || ''
 const PORT = Number(process.env.PORT) || 3001
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173'
-const GEO_ROUTE_API_URL = process.env.GEO_ROUTE_API_URL || ''
-const GEO_PARKING_API_URL = process.env.GEO_PARKING_API_URL || ''
-const GEO_API_KEY = process.env.GEO_API_KEY || ''
-const GEO_API_KEY_HEADER = process.env.GEO_API_KEY_HEADER || 'Authorization'
-const GEO_API_KEY_PREFIX = process.env.GEO_API_KEY_PREFIX ?? 'Bearer '
+const CLIENT_ORIGIN = String(process.env.CLIENT_ORIGIN || 'http://localhost:5173').trim()
+const GEO_ROUTE_API_URL = String(process.env.GEO_ROUTE_API_URL || '').trim()
+const GEO_PARKING_API_URL = String(process.env.GEO_PARKING_API_URL || '').trim()
+const GEO_API_KEY = String(process.env.GEO_API_KEY || '').trim()
+const GEO_API_KEY_HEADER = String(process.env.GEO_API_KEY_HEADER || 'Authorization').trim()
+const GEO_API_KEY_PREFIX = String(process.env.GEO_API_KEY_PREFIX ?? 'Bearer ')
 const GEO_PROVIDER_TIMEOUT_MS = Number(process.env.GEO_PROVIDER_TIMEOUT_MS || 12000)
 const ADMIN_BOOTSTRAP_EMAIL = String(process.env.ADMIN_BOOTSTRAP_EMAIL || '').toLowerCase().trim()
 const PSEUDO_LIVE_AUTO_START = !['0', 'false', 'no'].includes(String(process.env.PSEUDO_LIVE_AUTO_START || 'true').toLowerCase())
@@ -230,10 +230,11 @@ function mapDurationFromCongestion(norm) {
 function pickRoundRobinLane(candidateIds) {
   if (candidateIds.length === 0) return null
   const ids = [...candidateIds].sort((a, b) => a - b)
-  if (lastServedLaneId == null) return ids[0]
+  if (lastServedLaneId == null) return { id: ids[0], wrapped: false }
   const idx = ids.findIndex((id) => id === lastServedLaneId)
-  if (idx === -1) return ids[0]
-  return ids[(idx + 1) % ids.length]
+  if (idx === -1) return { id: ids[0], wrapped: false }
+  const nextIndex = (idx + 1) % ids.length
+  return { id: ids[nextIndex], wrapped: nextIndex === 0 && ids.length > 1 }
 }
 
 function isHttpUrl(value) {
@@ -326,9 +327,11 @@ function getLaneRowsFromLiveState() {
 
 function chooseNextRoundRobinLane(candidates) {
   const viable = candidates.filter((lane) => typeof lane.congestionNorm === 'number')
-  if (viable.length === 0) return null
-  const chosenId = pickRoundRobinLane(viable.map((lane) => lane.id))
-  return viable.find((lane) => lane.id === chosenId) || viable[0]
+  if (viable.length === 0) return { lane: null, wrapped: false }
+  const orderedIds = viable.map((lane) => lane.id).sort((a, b) => a - b)
+  const pick = pickRoundRobinLane(orderedIds)
+  const chosen = viable.find((lane) => lane.id === pick?.id) || viable[0]
+  return { lane: chosen, wrapped: Boolean(pick?.wrapped && chosen?.id === orderedIds[0]) }
 }
 
 function detectPythonCommand() {
@@ -599,7 +602,6 @@ async function googlePlanRoutes({ source, destination, sourceCoords, destination
     computeAlternativeRoutes: true,
     units: 'METRIC',
     languageCode: 'en-US',
-    departureTime: new Date().toISOString(),
   }
 
   const { ok, status, data } = await fetchJsonWithTimeout(GOOGLE_ROUTES_COMPUTE_URL, {
@@ -765,13 +767,16 @@ app.post('/api/ai/decision', authMiddleware, (req, res) => {
   const candidates = lanes.filter(
     (lane) => activeLaneIds.includes(lane.id) && lane.available && !lane.stale && typeof lane.congestionNorm === 'number',
   )
-  let chosen = chooseNextRoundRobinLane(candidates)
+  let { lane: chosen, wrapped: rotationWrapped } = chooseNextRoundRobinLane(candidates)
 
   if (Number.isInteger(emergencyLane) && activeLaneIds.includes(emergencyLane)) {
     const forced = lanes.find(
       (lane) => lane.id === emergencyLane && lane.available && !lane.stale && typeof lane.congestionNorm === 'number',
     )
-    if (forced) chosen = forced
+    if (forced) {
+      chosen = forced
+      rotationWrapped = false
+    }
   }
 
   if (!chosen) {
@@ -785,6 +790,7 @@ app.post('/api/ai/decision', authMiddleware, (req, res) => {
       reason: stateFresh
         ? 'No active lanes with usable pseudo-live video data are ready yet. waiting for signal'
         : 'Pseudo-live analyzer is warming up, stopped, or stale. waiting for signal',
+      rotationWrapped: false,
       thresholds: { empty: EMPTY_THRESHOLD, veryHigh: VERY_HIGH_THRESHOLD },
       lanes,
     })
@@ -796,7 +802,9 @@ app.post('/api/ai/decision', authMiddleware, (req, res) => {
     d <= EMPTY_THRESHOLD ? 'empty' : d >= VERY_HIGH_THRESHOLD ? 'very_high' : 'medium'
   const reasonPrefix = Number.isInteger(emergencyLane) && emergencyLane === chosen.id
     ? `Emergency override for Lane ${chosen.id}.`
-    : `Round robin selected Lane ${chosen.id}.`
+    : rotationWrapped
+      ? `Round robin completed a full cycle and returned to Lane ${chosen.id}.`
+      : `Round robin selected Lane ${chosen.id}.`
   const reason =
     level === 'very_high'
       ? `${reasonPrefix} Very high congestion (${d.toFixed(2)}) with ${chosen.vehicleCount} vehicles detected, assigning max green time of 90 seconds.`
@@ -813,6 +821,7 @@ app.post('/api/ai/decision', authMiddleware, (req, res) => {
     greenLaneId: chosen.id,
     greenTimeSec,
     reason,
+    rotationWrapped,
     thresholds: { empty: EMPTY_THRESHOLD, veryHigh: VERY_HIGH_THRESHOLD },
     lanes,
   })

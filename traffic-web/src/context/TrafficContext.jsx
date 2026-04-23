@@ -52,8 +52,6 @@ function buildInitialLanes() {
 export function TrafficProvider({ children }) {
   const { user, canAccessAuthority } = useAuth()
   const [lanes, setLanes] = useState(() => buildInitialLanes())
-  const [simulationRunning, setSimulationRunning] = useState(true)
-  const [simulationSpeed, setSimulationSpeed] = useState(1)
   const [currentGreenLane, setCurrentGreenLane] = useState(() => {
     const first = buildInitialLanes().find((lane) => lane.streamUrl)
     return first?.id ?? null
@@ -67,12 +65,6 @@ export function TrafficProvider({ children }) {
     { id: 1, type: 'Heavy Traffic', message: 'Lane 4 is reaching congestion threshold.', level: 'warning' },
     { id: 2, type: 'Roadblock', message: 'Minor roadblock detected on Route B.', level: 'critical' },
   ])
-  const [modeComparison] = useState({
-    fixedAvgWait: 108,
-    aiAvgWait: 64,
-    fixedThroughput: 74,
-    aiThroughput: 112,
-  })
   const [densitySeries, setDensitySeries] = useState([])
   const [predictionSeries, setPredictionSeries] = useState([])
   const [rlTrainingSeries, setRlTrainingSeries] = useState(
@@ -110,7 +102,7 @@ export function TrafficProvider({ children }) {
   }, [currentGreenLane])
 
   useEffect(() => {
-    if (!simulationRunning || !user) return
+    if (!user) return
 
     const interval = setInterval(async () => {
       setLanes((prev) =>
@@ -200,10 +192,10 @@ export function TrafficProvider({ children }) {
       } finally {
         inFlightRef.current = false
       }
-    }, Math.max(250, 1000 / simulationSpeed))
+    }, 1000)
 
     return () => clearInterval(interval)
-  }, [simulationRunning, simulationSpeed, aiMode, manualLane, manualDuration, emergencyLane, user, canAccessAuthority])
+  }, [aiMode, manualLane, manualDuration, emergencyLane, user, canAccessAuthority])
 
   useEffect(() => {
     const stamp = new Date().toLocaleTimeString()
@@ -229,10 +221,6 @@ export function TrafficProvider({ children }) {
     lanes,
     activeLanes,
     densityMeta,
-    simulationRunning,
-    setSimulationRunning,
-    simulationSpeed,
-    setSimulationSpeed,
     aiMode,
     setAiMode,
     manualLane,
@@ -246,18 +234,10 @@ export function TrafficProvider({ children }) {
     setAlerts,
     emergencyLane,
     setEmergencyLane,
-    modeComparison,
     densitySeries,
     predictionSeries,
     rlTrainingSeries,
     setRlTrainingSeries,
-    resetSimulation: () => {
-      const initial = buildInitialLanes()
-      setLanes(initial)
-      const first = initial.find((lane) => lane.streamUrl)
-      setCurrentGreenLane(first?.id ?? null)
-      setEmergencyLane(null)
-    },
   }
 
   return <TrafficContext.Provider value={value}>{children}</TrafficContext.Provider>

@@ -1,7 +1,7 @@
 import { useTraffic } from '../../context/TrafficContext'
 
 export default function ManualControlPanel() {
-  const { manualLane, setManualLane, manualDuration, setManualDuration, lanes, modeComparison } = useTraffic()
+  const { manualLane, setManualLane, manualDuration, setManualDuration, lanes } = useTraffic()
 
   return (
     <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
@@ -35,16 +35,6 @@ export default function ManualControlPanel() {
         </label>
       </div>
 
-      <div className="mt-4 grid grid-cols-2 gap-2 text-xs">
-        <div className="rounded-lg border border-slate-700 bg-slate-950 p-3">
-          <p className="text-slate-400">Fixed Signal Avg Wait</p>
-          <p className="text-rose-300">{modeComparison.fixedAvgWait}s</p>
-        </div>
-        <div className="rounded-lg border border-slate-700 bg-slate-950 p-3">
-          <p className="text-slate-400">AI Avg Wait</p>
-          <p className="text-emerald-300">{modeComparison.aiAvgWait}s</p>
-        </div>
-      </div>
     </section>
   )
 }
