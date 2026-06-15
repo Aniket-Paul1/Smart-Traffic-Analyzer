@@ -18,6 +18,17 @@ function cameraUrlsFromEnv() {
   return parts.slice(0, 9)
 }
 
+function laneWidthsFromEnv() {
+  const raw = import.meta.env.VITE_LANE_WIDTHS
+  if (typeof raw !== 'string' || !raw.trim()) return Array(9).fill(3.5)
+  const parts = raw.split(',').map((s) => {
+    const w = parseFloat(s.trim())
+    return Number.isFinite(w) && w >= 0.5 ? w : 3.5
+  })
+  while (parts.length < 9) parts.push(3.5)
+  return parts.slice(0, 9)
+}
+
 function labelFromSource(streamUrl, laneId) {
   if (!streamUrl) return 'NULL'
   const clean = streamUrl.split('?')[0]
@@ -25,12 +36,17 @@ function labelFromSource(streamUrl, laneId) {
   return parts[parts.length - 1] || `Lane ${laneId}`
 }
 
+const VEHICLES_PER_METER_WIDTH = 2.5
+
 function buildInitialLanes() {
   const urls = cameraUrlsFromEnv()
+  const widths = laneWidthsFromEnv()
   const firstVideoLane = urls.findIndex((u) => Boolean(u && u.length > 0)) + 1
   return Array.from({ length: 9 }).map((_, i) => {
     const source = urls[i]
     const streamUrl = source && source.length > 0 ? source : null
+    const widthM = widths[i]
+    const cap = Math.max(1, widthM * VEHICLES_PER_METER_WIDTH)
     return {
       id: i + 1,
       name: `Lane ${i + 1}`,
@@ -39,12 +55,17 @@ function buildInitialLanes() {
       queueLength: 0,
       vehicleCount: 0,
       avgSpeedKmh: 0,
+      pedestrianCount: 0,
+      emergencyDetected: false,
       available: Boolean(streamUrl),
       sourceError: '',
       status: firstVideoLane > 0 && i + 1 === firstVideoLane ? 'GREEN' : 'RED',
       timer: 0,
       videoLabel: labelFromSource(streamUrl, i + 1),
       streamUrl,
+      // Width-aware fields
+      laneWidthM: widthM,
+      laneCapacity: cap,
     }
   })
 }
@@ -59,7 +80,9 @@ export function TrafficProvider({ children }) {
   const [aiMode, setAiMode] = useState(true)
   const [manualLane, setManualLane] = useState(1)
   const [manualDuration, setManualDuration] = useState(55)
-  const [aiReason, setAiReason] = useState('AI decisions are based on pseudo-live congestion from the configured lane videos')
+  const [aiReason, setAiReason] = useState(
+    'AI decisions use width-aware congestion scoring: score = vehicles ÷ (laneWidth × 2.5)',
+  )
   const [emergencyLane, setEmergencyLane] = useState(null)
   const [alerts, setAlerts] = useState([
     { id: 1, type: 'Heavy Traffic', message: 'Lane 4 is reaching congestion threshold.', level: 'warning' },
@@ -69,6 +92,15 @@ export function TrafficProvider({ children }) {
   const [rlTrainingSeries, setRlTrainingSeries] = useState(
     Array.from({ length: 30 }).map((_, i) => ({ episode: i * 10 + 1, reward: -300 + i * 12 })),
   )
+
+  // New: safety and XAI state
+  const [safetyScore, setSafetyScore] = useState(100)
+  const [casualtyRisk, setCasualtyRisk] = useState('Minimal')
+  const [pedConflict, setPedConflict] = useState(false)
+  const [emergencyActive, setEmergencyActive] = useState(false)
+  const [xaiData, setXaiData] = useState(null)
+  const [congestionModel, setCongestionModel] = useState(null)
+
   const inFlightRef = useRef(false)
   const lanesRef = useRef(lanes)
   const currentGreenRef = useRef(currentGreenLane)
@@ -77,10 +109,7 @@ export function TrafficProvider({ children }) {
     const source = lanes.filter((lane) => Boolean(lane.streamUrl))
     if (source.length === 0) return 0
     return Number(
-      (
-        source.reduce((acc, lane) => acc + lane.queueLength * (lane.density + 0.3), 0) /
-        source.length
-      ).toFixed(1),
+      (source.reduce((acc, lane) => acc + lane.queueLength * (lane.density + 0.3), 0) / source.length).toFixed(1),
     )
   }, [lanes])
 
@@ -92,13 +121,25 @@ export function TrafficProvider({ children }) {
 
   const activeLanes = useMemo(() => lanes.filter((lane) => Boolean(lane.streamUrl)), [lanes])
 
-  useEffect(() => {
-    lanesRef.current = lanes
-  }, [lanes])
+  useEffect(() => { lanesRef.current = lanes }, [lanes])
+  useEffect(() => { currentGreenRef.current = currentGreenLane }, [currentGreenLane])
 
+  // Fetch XAI data every 5 seconds
   useEffect(() => {
-    currentGreenRef.current = currentGreenLane
-  }, [currentGreenLane])
+    if (!user) return
+    const fetchXai = async () => {
+      try {
+        const data = await apiJson('/api/xai/decision')
+        setXaiData(data)
+        if (data.congestionModel) setCongestionModel(data.congestionModel)
+      } catch {
+        // non-critical
+      }
+    }
+    fetchXai()
+    const id = setInterval(fetchXai, 5000)
+    return () => clearInterval(id)
+  }, [user])
 
   useEffect(() => {
     if (!user) return
@@ -167,6 +208,14 @@ export function TrafficProvider({ children }) {
         const greenTime = Math.max(40, Math.min(90, Number(data.greenTimeSec) || 40))
         setCurrentGreenLane(Number.isInteger(selected) ? selected : null)
         setAiReason(String(data.reason || 'AI decision applied'))
+
+        // Update safety state
+        if (typeof data.safetyScore === 'number') setSafetyScore(data.safetyScore)
+        if (data.casualtyRisk) setCasualtyRisk(data.casualtyRisk)
+        setPedConflict(Boolean(data.pedConflict))
+        setEmergencyActive(Boolean(data.emergencyActive))
+        if (data.congestionModel) setCongestionModel(data.congestionModel)
+
         setLanes((prev) =>
           prev.map((lane) => {
             const aiLane = Array.isArray(data.lanes) ? data.lanes.find((row) => Number(row.id) === lane.id) : null
@@ -181,6 +230,11 @@ export function TrafficProvider({ children }) {
               queueLength: Math.round(density * 30),
               vehicleCount: Number(aiLane?.vehicleCount || 0),
               avgSpeedKmh: Number(aiLane?.avgSpeedKmh || 0),
+              pedestrianCount: Number(aiLane?.pedestrianCount || 0),
+              emergencyDetected: Boolean(aiLane?.emergencyDetected),
+              // Width-aware fields
+              laneWidthM: Number.isFinite(Number(aiLane?.laneWidthM)) ? Number(aiLane.laneWidthM) : (lane.laneWidthM ?? 3.5),
+              laneCapacity: Number.isFinite(Number(aiLane?.laneCapacity)) ? Number(aiLane.laneCapacity) : (lane.laneCapacity ?? 8.75),
               status: lane.id === selected ? 'GREEN' : 'RED',
               timer: lane.id === selected ? greenTime : 0,
             }
@@ -237,6 +291,13 @@ export function TrafficProvider({ children }) {
     predictionSeries,
     rlTrainingSeries,
     setRlTrainingSeries,
+    // Safety & XAI
+    safetyScore,
+    casualtyRisk,
+    pedConflict,
+    emergencyActive,
+    xaiData,
+    congestionModel,
   }
 
   return <TrafficContext.Provider value={value}>{children}</TrafficContext.Provider>

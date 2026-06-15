@@ -24,15 +24,17 @@ export default function LaneCard({ lane }) {
   const hasVideo = Boolean(streamSrc)
   const videoRef = useRef(null)
 
+  const laneWidthM = lane.laneWidthM ?? 3.5
+  const laneCapacity = lane.laneCapacity ?? Math.max(1, laneWidthM * 2.5)
+  const pedWarning = (lane.pedestrianCount ?? 0) > 0
+  const emergWarning = Boolean(lane.emergencyDetected)
+
   useEffect(() => {
     const el = videoRef.current
     if (!el || !hasVideo || feedFailed) return
-
     if (isGreen) {
-      const playPromise = el.play()
-      if (playPromise && typeof playPromise.catch === 'function') {
-        playPromise.catch(() => {})
-      }
+      const p = el.play()
+      if (p?.catch) p.catch(() => {})
     } else {
       el.pause()
     }
@@ -45,6 +47,7 @@ export default function LaneCard({ lane }) {
         <span className="text-xs text-slate-400">{lane.videoLabel}</span>
       </div>
 
+      {/* Video feed */}
       <div className="relative mb-3 h-24 overflow-hidden rounded-lg bg-slate-800">
         {hasVideo && !feedFailed && (
           <video
@@ -62,7 +65,7 @@ export default function LaneCard({ lane }) {
         {hasVideo && feedFailed && (
           <div className="absolute inset-0 bg-slate-800">
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(34,211,238,0.25),transparent_70%)]" />
-            <div className="absolute inset-0 flex items-center justify-center text-[10px] text-slate-500">Feed unavailable (offline?)</div>
+            <div className="absolute inset-0 flex items-center justify-center text-[10px] text-slate-500">Feed unavailable</div>
           </div>
         )}
         {!hasVideo && (
@@ -78,6 +81,18 @@ export default function LaneCard({ lane }) {
         <div className="absolute bottom-2 left-2 text-xs text-slate-200 drop-shadow-md">
           {!hasVideo ? 'waiting for signal' : isGreen ? 'Vehicle flow active' : 'Queued at signal'}
         </div>
+
+        {/* Safety badge overlays */}
+        {pedWarning && (
+          <div className="absolute left-2 top-2 rounded bg-amber-500/90 px-1.5 py-0.5 text-[9px] font-bold text-slate-950">
+            🚶 PED
+          </div>
+        )}
+        {emergWarning && (
+          <div className="absolute left-2 top-2 rounded bg-rose-500/90 px-1.5 py-0.5 text-[9px] font-bold text-white">
+            🚨 EMERG
+          </div>
+        )}
       </div>
 
       <p className="mb-2 text-[10px] leading-tight text-slate-500">
@@ -85,9 +100,10 @@ export default function LaneCard({ lane }) {
           ? 'Lane not configured in this intersection.'
           : lane.sourceError
             ? lane.sourceError
-            : 'Congestion is computed from pseudo-live object detection on this lane video.'}
+            : 'Width-aware congestion: score = vehicles ÷ (width × 2.5)'}
       </p>
 
+      {/* Signal status */}
       <div className="mb-2 flex items-center justify-between text-xs">
         <div className="flex items-center gap-1.5">
           <SignalLight active={isGreen} color="bg-emerald-500 shadow-emerald-500/40" />
@@ -110,11 +126,46 @@ export default function LaneCard({ lane }) {
         <span>Avg Speed</span>
         <span className="font-semibold text-slate-100">{lane.avgSpeedKmh.toFixed(1)} km/h</span>
       </div>
+
+      {/* Width-aware congestion breakdown */}
+      {hasVideo && (
+        <div className="mb-2 rounded-lg border border-slate-700/60 bg-slate-800/40 px-2 py-1.5 text-[10px] text-slate-400">
+          <div className="mb-1 font-medium text-slate-300">Congestion Score Breakdown</div>
+          <div className="flex items-center justify-between">
+            <span>Lane Width</span>
+            <span className="font-semibold text-cyan-300">{laneWidthM.toFixed(1)} m</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span>Capacity (w × 2.5)</span>
+            <span className="font-semibold text-slate-200">≈ {laneCapacity.toFixed(1)} vehicles</span>
+          </div>
+          <div className="mt-0.5 flex items-center justify-between border-t border-slate-700/40 pt-0.5">
+            <span>{lane.vehicleCount} ÷ {laneCapacity.toFixed(1)}</span>
+            <span className={clsx('font-bold', density.color)}>= {lane.density.toFixed(2)}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Pedestrian / emergency row */}
+      {hasVideo && (pedWarning || emergWarning || (lane.pedestrianCount ?? 0) > 0) && (
+        <div className="mb-2 flex items-center gap-2 text-[10px]">
+          {(lane.pedestrianCount ?? 0) > 0 && (
+            <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-amber-300">
+              ⚠️ {lane.pedestrianCount} pedestrian{lane.pedestrianCount > 1 ? 's' : ''} — yield alert
+            </span>
+          )}
+          {emergWarning && (
+            <span className="rounded bg-rose-500/20 px-1.5 py-0.5 text-rose-300">🚨 Emergency</span>
+          )}
+        </div>
+      )}
+
+      {/* Congestion bar */}
       <div className="mb-1 h-2 rounded-full bg-slate-800">
         <div className={clsx('h-full rounded-full', density.bg)} style={{ width: `${Math.min(100, lane.density * 100)}%` }} />
       </div>
       <div className="flex items-center justify-between text-xs">
-        <span className="text-slate-400">Density</span>
+        <span className="text-slate-400">Congestion</span>
         <span className={density.color}>
           {density.label} ({lane.density.toFixed(2)})
         </span>

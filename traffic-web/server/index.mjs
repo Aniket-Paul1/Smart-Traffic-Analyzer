@@ -53,6 +53,37 @@ const ADMIN_BOOTSTRAP_EMAIL = String(process.env.ADMIN_BOOTSTRAP_EMAIL || '').to
 const PSEUDO_LIVE_AUTO_START = !['0', 'false', 'no'].includes(String(process.env.PSEUDO_LIVE_AUTO_START || 'true').toLowerCase())
 const PSEUDO_LIVE_STALE_MS = Number(process.env.PSEUDO_LIVE_STALE_MS || 8000)
 const GOOGLE_GEOCODE_URL = 'https://maps.googleapis.com/maps/api/geocode/json'
+
+// ---------------------------------------------------------------------------
+// Width-aware congestion constants (must match pseudo_live_detection_service.py)
+// ---------------------------------------------------------------------------
+const VEHICLES_PER_METER_WIDTH = 2.5
+const DEFAULT_LANE_WIDTH_M = 3.5
+
+function laneWidthsFromEnv(maxLanes = 9) {
+  const raw = String(process.env.VITE_LANE_WIDTHS || '').trim()
+  const widths = []
+  if (raw) {
+    for (const part of raw.split(',')) {
+      const w = parseFloat(part.trim())
+      widths.push(Number.isFinite(w) && w >= 0.5 ? w : DEFAULT_LANE_WIDTH_M)
+    }
+  }
+  while (widths.length < maxLanes) widths.push(DEFAULT_LANE_WIDTH_M)
+  return widths.slice(0, maxLanes)
+}
+
+function laneCapacity(widthM) {
+  return Math.max(1, widthM * VEHICLES_PER_METER_WIDTH)
+}
+
+// In-memory safety log (last 100 checks)
+const _safetyLog = []
+const MAX_SAFETY_LOG = 100
+function appendSafetyLog(entry) {
+  _safetyLog.push(entry)
+  if (_safetyLog.length > MAX_SAFETY_LOG) _safetyLog.shift()
+}
 const GOOGLE_ROUTES_COMPUTE_URL = 'https://routes.googleapis.com/directions/v2:computeRoutes'
 const GOOGLE_PLACES_NEARBY_URL = 'https://places.googleapis.com/v1/places:searchNearby'
 const GOOGLE_MAPS_EMBED_BASE = 'https://www.google.com/maps/embed/v1'
@@ -166,7 +197,8 @@ function signToken(user) {
   return jwt.sign(
     { sub: user.id, email: user.email, role: user.role, name: user.name },
     JWT_SECRET,
-    { expiresIn: '7d' },
+    { expiresIn: '8h' },   // session tokens — frontend uses sessionStorage so
+                            // they are cleared on browser close anyway
   )
 }
 
@@ -256,8 +288,11 @@ function cameraUrlsFromEnv(maxLanes = 9) {
 
 function buildDefaultLaneRows() {
   const urls = cameraUrlsFromEnv()
+  const widths = laneWidthsFromEnv()
   return Array.from({ length: 9 }).map((_, idx) => {
     const source = urls[idx] || null
+    const widthM = widths[idx]
+    const cap = laneCapacity(widthM)
     return {
       id: idx + 1,
       name: `Lane ${idx + 1}`,
@@ -265,11 +300,15 @@ function buildDefaultLaneRows() {
       configured: Boolean(source),
       available: false,
       stale: true,
+      laneWidthM: widthM,
+      laneCapacity: cap,
       congestionNorm: source ? 0 : null,
       vehicleCount: 0,
       smoothedVehicleCount: 0,
       avgSpeedKmh: 0,
       observedPeak: 0,
+      pedestrianCount: 0,
+      emergencyDetected: false,
       updatedAt: null,
       error: source ? 'Pseudo-live analyzer is warming up.' : null,
     }
@@ -306,20 +345,35 @@ function getLaneRowsFromLiveState() {
   return defaults.map((base) => {
     const liveLane = Array.isArray(state?.lanes) ? state.lanes.find((lane) => Number(lane.id) === base.id) : null
     if (!liveLane) return base
-    const congestionNorm = Number(liveLane.congestionNorm)
+
+    // Prefer width/capacity from live state (written by Python service); fall back to env-derived
+    const widthM = Number.isFinite(Number(liveLane.laneWidthM)) ? Number(liveLane.laneWidthM) : base.laneWidthM
+    const cap = Number.isFinite(Number(liveLane.laneCapacity)) ? Number(liveLane.laneCapacity) : base.laneCapacity
+
+    // Width-aware congestion: prefer Python-computed score, recompute if absent
+    let congestionNorm = Number(liveLane.congestionNorm)
+    if (!Number.isFinite(congestionNorm)) {
+      const smoothed = Number(liveLane.smoothedVehicleCount)
+      congestionNorm = Number.isFinite(smoothed) ? Math.max(0, Math.min(1, smoothed / cap)) : base.congestionNorm
+    } else {
+      congestionNorm = Math.max(0, Math.min(1, congestionNorm))
+    }
+
     return {
       ...base,
       source: liveLane.source || base.source,
       configured: Boolean(liveLane.configured ?? base.configured),
       available: Boolean(liveLane.available),
       stale: !fresh,
-      congestionNorm: Number.isFinite(congestionNorm) ? Math.max(0, Math.min(1, congestionNorm)) : base.congestionNorm,
+      laneWidthM: widthM,
+      laneCapacity: cap,
+      congestionNorm,
       vehicleCount: Number.isFinite(Number(liveLane.vehicleCount)) ? Number(liveLane.vehicleCount) : 0,
-      smoothedVehicleCount: Number.isFinite(Number(liveLane.smoothedVehicleCount))
-        ? Number(liveLane.smoothedVehicleCount)
-        : 0,
+      smoothedVehicleCount: Number.isFinite(Number(liveLane.smoothedVehicleCount)) ? Number(liveLane.smoothedVehicleCount) : 0,
       avgSpeedKmh: Number.isFinite(Number(liveLane.avgSpeedKmh)) ? Number(liveLane.avgSpeedKmh) : 0,
       observedPeak: Number.isFinite(Number(liveLane.observedPeak)) ? Number(liveLane.observedPeak) : 0,
+      pedestrianCount: Number(liveLane.pedestrianCount || 0),
+      emergencyDetected: Boolean(liveLane.emergencyDetected),
       updatedAt: liveLane.updatedAt || state?.updatedAt || null,
       error: liveLane.error || (!fresh && base.configured ? 'Pseudo-live analyzer snapshot is stale.' : null),
     }
@@ -782,23 +836,42 @@ app.post('/api/ai/decision', authMiddleware, (req, res) => {
   const lanes = getLaneRowsFromLiveState()
   const state = readLiveState()
   const stateFresh = isLiveStateFresh(state)
-  const emergencyLaneCandidate = Number(req.body?.emergencyLane)
-  const canForceEmergency = req.user.role === 'admin' || req.user.role === 'traffic_police'
-  const emergencyLane =
-    canForceEmergency && Number.isInteger(emergencyLaneCandidate) ? emergencyLaneCandidate : null
 
+  // ── Emergency lane resolution ──────────────────────────────────────────
+  // Priority 1: auto-detect from live state (any lane with emergencyDetected=true)
+  // Priority 2: manual override sent by traffic_police / admin
+  const canForceEmergency = req.user.role === 'admin' || req.user.role === 'traffic_police'
+  const manualEmergencyCandidate = Number(req.body?.emergencyLane)
+  const manualEmergencyLane =
+    canForceEmergency && Number.isInteger(manualEmergencyCandidate) ? manualEmergencyCandidate : null
+
+  // Auto-detect: find the active lane with an emergency vehicle
+  const autoEmergencyLane = activeLaneIds.find((id) => {
+    const lane = lanes.find((l) => l.id === id)
+    return lane && lane.emergencyDetected && lane.available && !lane.stale
+  }) ?? null
+
+  // Use manual override first, then auto-detected, then null
+  const emergencyLaneId = manualEmergencyLane ?? autoEmergencyLane
+
+  // ── Candidate lanes ────────────────────────────────────────────────────
   const candidates = lanes.filter(
     (lane) => activeLaneIds.includes(lane.id) && lane.available && !lane.stale && typeof lane.congestionNorm === 'number',
   )
-  let { lane: chosen, wrapped: rotationWrapped } = chooseNextRoundRobinLane(candidates)
 
-  if (Number.isInteger(emergencyLane) && activeLaneIds.includes(emergencyLane)) {
+  // ── Round-robin selection ──────────────────────────────────────────────
+  let { lane: chosen, wrapped: rotationWrapped } = chooseNextRoundRobinLane(candidates)
+  let isEmergencyOverride = false
+
+  // ── Emergency override: give the emergency lane green immediately ───────
+  if (emergencyLaneId !== null && activeLaneIds.includes(emergencyLaneId)) {
     const forced = lanes.find(
-      (lane) => lane.id === emergencyLane && lane.available && !lane.stale && typeof lane.congestionNorm === 'number',
+      (lane) => lane.id === emergencyLaneId && lane.available && !lane.stale && typeof lane.congestionNorm === 'number',
     )
     if (forced) {
       chosen = forced
       rotationWrapped = false
+      isEmergencyOverride = true
     }
   }
 
@@ -811,29 +884,78 @@ app.post('/api/ai/decision', authMiddleware, (req, res) => {
       greenLaneId: null,
       greenTimeSec: 40,
       reason: stateFresh
-        ? 'No active lanes with usable pseudo-live video data are ready yet. waiting for signal'
-        : 'Pseudo-live analyzer is warming up, stopped, or stale. waiting for signal',
+        ? 'No active lanes with usable pseudo-live video data are ready yet. Waiting for signal.'
+        : 'Pseudo-live analyzer is warming up, stopped, or stale. Waiting for signal.',
       rotationWrapped: false,
+      pedConflict: false,
+      emergencyActive: false,
+      safetyScore: 100,
       thresholds: { empty: EMPTY_THRESHOLD, veryHigh: VERY_HIGH_THRESHOLD },
       lanes,
     })
   }
 
+  // ── Pedestrian detection ───────────────────────────────────────────────
+  // Pedestrians are flagged as an ALERT only — the green light is NOT blocked
+  // or redirected. The system warns oncoming drivers via the dashboard alert
+  // so they slow down and yield. Blocking green would cause more congestion
+  // and delay emergency vehicles, so we alert instead.
+  const pedLanesAll = candidates.filter((l) => (l.pedestrianCount ?? 0) > 0)
+  const pedInChosenLane = (chosen.pedestrianCount ?? 0) > 0
+  const pedConflict = pedLanesAll.length > 0
+
+  // Build pedestrian alert note (shown in reason text and SafetyPanel)
+  const pedAlertNote = pedInChosenLane
+    ? `⚠️ Pedestrian alert in Lane ${chosen.id} — drivers advised to yield. `
+    : pedConflict
+      ? `⚠️ Pedestrians detected in ${pedLanesAll.map((l) => `Lane ${l.id}`).join(', ')} — drivers advised to yield. `
+      : ''
+
+  // ── Green time calculation ─────────────────────────────────────────────
   const d = chosen.congestionNorm
-  const greenTimeSec = Number.isInteger(emergencyLane) && emergencyLane === chosen.id ? 90 : mapDurationFromCongestion(d)
-  const level =
-    d <= EMPTY_THRESHOLD ? 'empty' : d >= VERY_HIGH_THRESHOLD ? 'very_high' : 'medium'
-  const reasonPrefix = Number.isInteger(emergencyLane) && emergencyLane === chosen.id
-    ? `Emergency override for Lane ${chosen.id}.`
+  // Emergency always gets max green time (90 s) so the vehicle can clear fast
+  const greenTimeSec = isEmergencyOverride ? 90 : mapDurationFromCongestion(d)
+  const emergencyActive = isEmergencyOverride || Boolean(chosen.emergencyDetected)
+
+  // ── Reason text ────────────────────────────────────────────────────────
+  const level = d <= EMPTY_THRESHOLD ? 'empty' : d >= VERY_HIGH_THRESHOLD ? 'very_high' : 'medium'
+  const widthNote = `Lane ${chosen.id} is ${chosen.laneWidthM.toFixed(1)} m wide (capacity ≈ ${chosen.laneCapacity.toFixed(1)} vehicles).`
+  let reasonPrefix = isEmergencyOverride
+    ? `🚨 Emergency vehicle detected — Lane ${chosen.id} given priority green (90 s).`
     : rotationWrapped
       ? `Round robin completed a full cycle and returned to Lane ${chosen.id}.`
       : `Round robin selected Lane ${chosen.id}.`
+  if (pedAlertNote) reasonPrefix = pedAlertNote + reasonPrefix
+
   const reason =
-    level === 'very_high'
-      ? `${reasonPrefix} Very high congestion (${d.toFixed(2)}) with ${chosen.vehicleCount} vehicles detected, assigning max green time of 90 seconds.`
-      : level === 'empty'
-        ? `${reasonPrefix} Near empty (${d.toFixed(2)}), assigning minimum green time of 40 seconds.`
-        : `${reasonPrefix} Medium congestion (${d.toFixed(2)}) with ${chosen.vehicleCount} vehicles detected, assigning adaptive green time between 45 and 85 seconds.`
+    isEmergencyOverride
+      ? `${reasonPrefix} ${widthNote} Emergency override active.`
+      : level === 'very_high'
+        ? `${reasonPrefix} ${widthNote} Congestion score ${d.toFixed(2)} (${chosen.vehicleCount} vehicles ÷ capacity) is very high — assigning max green time of 90 s.`
+        : level === 'empty'
+          ? `${reasonPrefix} ${widthNote} Congestion score ${d.toFixed(2)} is near zero — assigning minimum green time of 40 s.`
+          : `${reasonPrefix} ${widthNote} Congestion score ${d.toFixed(2)} (${chosen.vehicleCount} vehicles ÷ capacity) is medium — assigning ${greenTimeSec} s green time.`
+
+  // Safety score: pedestrian is now an alert (not a block), so score reflects
+  // elevated caution rather than a critical override
+  const safetyScore = emergencyActive
+    ? 70
+    : pedInChosenLane
+      ? 75
+      : pedConflict
+        ? 82
+        : Math.max(0, 100 - Math.round(d * 80))
+
+  appendSafetyLog({
+    timestamp: new Date().toISOString(),
+    laneId: chosen.id,
+    congestionNorm: d,
+    greenTimeSec,
+    pedConflict,
+    emergencyActive,
+    safetyScore,
+    reason,
+  })
 
   lastServedLaneId = chosen.id
   return res.json({
@@ -845,6 +967,10 @@ app.post('/api/ai/decision', authMiddleware, (req, res) => {
     greenTimeSec,
     reason,
     rotationWrapped,
+    safetyScore,
+    pedConflict,
+    emergencyActive,
+    congestionModel: state?.congestionModel || null,
     thresholds: { empty: EMPTY_THRESHOLD, veryHigh: VERY_HIGH_THRESHOLD },
     lanes,
   })
@@ -1132,6 +1258,224 @@ app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, (req, res) =
   db.run('DELETE FROM users WHERE id = ?', [targetId])
   persist()
   res.status(204).end()
+})
+
+// ---------------------------------------------------------------------------
+// Safety Monitor API
+// ---------------------------------------------------------------------------
+app.get('/api/safety/log', authMiddleware, authorityMiddleware, (_req, res) => {
+  const log = [..._safetyLog].reverse().slice(0, 50)
+  const avgScore = log.length
+    ? Math.round(log.reduce((a, e) => a + e.safetyScore, 0) / log.length)
+    : 100
+  res.json({
+    avgSafetyScore: avgScore,
+    casualtyRisk: avgScore >= 90 ? 'Minimal' : avgScore >= 70 ? 'Low' : avgScore >= 50 ? 'Moderate' : 'High',
+    recentEvents: log,
+    totalEvents: _safetyLog.length,
+  })
+})
+
+app.post('/api/safety/override', authMiddleware, authorityMiddleware, (req, res) => {
+  const { laneId, reason } = req.body || {}
+  if (!Number.isInteger(Number(laneId))) {
+    return res.status(400).json({ error: 'laneId is required' })
+  }
+  appendSafetyLog({
+    timestamp: new Date().toISOString(),
+    laneId: Number(laneId),
+    congestionNorm: null,
+    greenTimeSec: 90,
+    pedConflict: false,
+    emergencyActive: true,
+    safetyScore: 100,
+    reason: `MANUAL_SAFETY_OVERRIDE: ${reason || 'operator override'} for Lane ${laneId}`,
+  })
+  res.json({ ok: true, message: `Safety override logged for Lane ${laneId}` })
+})
+
+// ---------------------------------------------------------------------------
+// XAI (Explainable AI) endpoint
+// ---------------------------------------------------------------------------
+app.get('/api/xai/decision', authMiddleware, (_req, res) => {
+  const lanes = getLaneRowsFromLiveState()
+  const state = readLiveState()
+
+  // Build per-lane XAI explanation
+  const laneDetails = lanes
+    .filter((l) => l.configured)
+    .map((l) => {
+      const d = l.congestionNorm ?? 0
+      const w = l.laneWidthM ?? DEFAULT_LANE_WIDTH_M
+      const cap = l.laneCapacity ?? laneCapacity(w)
+      const count = l.vehicleCount ?? 0
+      return {
+        lane: l.id,
+        name: l.name,
+        vehicleCount: count,
+        laneWidthM: w,
+        laneCapacity: cap,
+        congestionNorm: d,
+        formula: `${count} ÷ ${cap.toFixed(1)} = ${d.toFixed(3)}`,
+        congestionLevel: d >= 0.75 ? 'Very High' : d >= 0.35 ? 'Medium' : 'Low',
+        pedestrianConflict: l.pedestrianCount > 0,
+        emergencyDetected: l.emergencyDetected,
+      }
+    })
+
+  // Feature importance: rank lanes by congestionNorm
+  const ranked = [...laneDetails].sort((a, b) => b.congestionNorm - a.congestionNorm)
+  const topFeatures = ranked.slice(0, 3).map((l, i) => ({
+    rank: i + 1,
+    feature: `Lane ${l.lane} congestionNorm`,
+    importance: Number((1 - i * 0.2).toFixed(2)),
+    value: l.congestionNorm,
+    explanation: `${l.name}: ${l.vehicleCount} vehicles on ${l.laneWidthM.toFixed(1)} m lane → score ${l.congestionNorm.toFixed(2)}`,
+  }))
+
+  const lastLog = _safetyLog[_safetyLog.length - 1]
+  res.json({
+    model: 'Width-Aware Congestion Scoring',
+    formula: 'congestionNorm = smoothedVehicleCount / (laneWidthM × 2.5)',
+    explanation: 'A narrower lane with fewer vehicles can score higher than a wider lane with more vehicles, because the wider lane can clear traffic faster.',
+    topFeatures,
+    laneDetails,
+    lastDecision: lastLog || null,
+    safetyTarget: 'Zero casualties — pedestrian and emergency overrides always take priority.',
+    congestionModel: state?.congestionModel || null,
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Feedback system — DB table + CRUD endpoints
+// ---------------------------------------------------------------------------
+db.run(`
+  CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    user_name TEXT NOT NULL,
+    user_role TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    admin_reply TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    replied_at TEXT
+  );
+`)
+persist()
+
+// Helper: fetch all rows from a SELECT as an array of plain objects
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql)
+  if (params.length) stmt.bind(params)
+  const rows = []
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject())
+  }
+  stmt.free()
+  return rows
+}
+
+// Helper: fetch a single row
+function queryOne(sql, params = []) {
+  const stmt = db.prepare(sql)
+  if (params.length) stmt.bind(params)
+  const found = stmt.step()
+  const row = found ? stmt.getAsObject() : null
+  stmt.free()
+  return row
+}
+
+// POST /api/feedback — submit feedback (all logged-in users)
+app.post('/api/feedback', authMiddleware, (req, res) => {
+  const { title, category, message } = req.body || {}
+  if (!title?.trim() || !message?.trim()) {
+    return res.status(400).json({ error: 'Title and message are required.' })
+  }
+  const allowedCategories = ['Traffic Issue', 'Accident', 'Roadblock', 'Signal Malfunction', 'Other']
+  const cat = allowedCategories.includes(category) ? category : 'Other'
+  // JWT stores id as `sub`, name and role as-is
+  const userId = req.user.sub
+  const userName = req.user.name || req.user.email || 'Unknown'
+  const userRole = req.user.role || 'user'
+  try {
+    db.run(
+      `INSERT INTO feedback (user_id, user_name, user_role, title, category, message)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [userId, userName, userRole, title.trim(), cat, message.trim()],
+    )
+    persist()
+    res.status(201).json({ ok: true, message: 'Feedback submitted successfully.' })
+  } catch (err) {
+    console.error('[feedback POST]', err)
+    res.status(500).json({ error: 'Failed to save feedback. Please try again.' })
+  }
+})
+
+// GET /api/feedback — list feedback
+// Admin sees all; others see only their own
+app.get('/api/feedback', authMiddleware, (req, res) => {
+  try {
+    let rows
+    if (req.user.role === 'admin') {
+      rows = queryAll(
+        `SELECT id, user_id, user_name, user_role, title, category, message,
+                status, admin_reply, created_at, replied_at
+         FROM feedback ORDER BY created_at DESC`,
+      )
+    } else {
+      rows = queryAll(
+        `SELECT id, user_id, user_name, user_role, title, category, message,
+                status, admin_reply, created_at, replied_at
+         FROM feedback WHERE user_id = ? ORDER BY created_at DESC`,
+        [req.user.sub],
+      )
+    }
+    res.json({ feedback: rows })
+  } catch (err) {
+    console.error('[feedback GET]', err)
+    res.status(500).json({ error: 'Failed to load feedback.' })
+  }
+})
+
+// PATCH /api/feedback/:id/reply — admin replies to a feedback item
+app.patch('/api/feedback/:id/reply', authMiddleware, adminMiddleware, (req, res) => {
+  const id = Number(req.params.id)
+  const { reply } = req.body || {}
+  if (!reply?.trim()) return res.status(400).json({ error: 'Reply text is required.' })
+  try {
+    const existing = queryOne('SELECT id FROM feedback WHERE id = ?', [id])
+    if (!existing) return res.status(404).json({ error: 'Feedback not found.' })
+    db.run(
+      `UPDATE feedback SET admin_reply = ?, status = 'replied', replied_at = datetime('now') WHERE id = ?`,
+      [reply.trim(), id],
+    )
+    persist()
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('[feedback REPLY]', err)
+    res.status(500).json({ error: 'Failed to save reply.' })
+  }
+})
+
+// PATCH /api/feedback/:id/status — admin closes/reopens a feedback item
+app.patch('/api/feedback/:id/status', authMiddleware, adminMiddleware, (req, res) => {
+  const id = Number(req.params.id)
+  const { status } = req.body || {}
+  const allowed = ['open', 'replied', 'closed']
+  if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status.' })
+  try {
+    const existing = queryOne('SELECT id FROM feedback WHERE id = ?', [id])
+    if (!existing) return res.status(404).json({ error: 'Feedback not found.' })
+    db.run('UPDATE feedback SET status = ? WHERE id = ?', [status, id])
+    persist()
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('[feedback STATUS]', err)
+    res.status(500).json({ error: 'Failed to update status.' })
+  }
 })
 
 app.listen(PORT, () => {

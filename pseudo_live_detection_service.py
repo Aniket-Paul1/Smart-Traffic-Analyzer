@@ -1,3 +1,24 @@
+"""
+pseudo_live_detection_service.py  (v2 — Smart Traffic Analyzer)
+
+Pseudo-Live Multi-Lane Detection Service
+=========================================
+Reads per-lane video sources (real files played on loop, or RTSP streams),
+runs YOLOv8 + DeepSort detection and tracking on every lane in parallel
+threads, and writes a live JSON state file every ~0.5 s for the dashboard.
+
+New in v2
+---------
+- Width-aware congestion:  score = smoothedCount / (laneWidthM × 2.5)
+- Pedestrian & emergency vehicle detection (COCO classes 0, 1, 5, 7)
+- Road-width estimation via IPM (perception/road_width_estimator.py)
+- Safety monitor integration (safety_xai/safety_monitor.py)
+- congestionModel metadata written to state JSON
+
+Lane widths are read from VITE_LANE_WIDTHS env variable (metres, CSV):
+    VITE_LANE_WIDTHS=3.5,3.5,4.0,3.0,4.0,3.5,3.0,4.0,3.5
+"""
+
 import json
 import math
 import os
@@ -16,8 +37,28 @@ TRAFFIC_WEB_DIR = ROOT_DIR / 'traffic-web'
 PUBLIC_DIR = TRAFFIC_WEB_DIR / 'public'
 DEFAULT_ENV_FILES = [TRAFFIC_WEB_DIR / '.env', ROOT_DIR / '.env']
 DEFAULT_STATE_FILE = ROOT_DIR / 'logs' / 'pseudo_live_state.json'
+
 VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+PEDESTRIAN_CLASS = 0
+CYCLIST_CLASS = 1
+ALL_DETECT_CLASSES = set(VEHICLE_CLASSES.keys()) | {PEDESTRIAN_CLASS, CYCLIST_CLASS}
+
 RUNNING = True
+
+# ---------------------------------------------------------------------------
+# Width-aware congestion model
+# ---------------------------------------------------------------------------
+# congestionScore = smoothedVehicleCount / laneCapacity
+# laneCapacity    = laneWidthMeters × VEHICLES_PER_METER_WIDTH
+#
+# Example (mentor's scenario):
+#   Lane A: 4 m wide, 8 vehicles → 8 / (4 × 2.5) = 0.80  HIGH
+#   Lane B: 2 m wide, 5 vehicles → 5 / (2 × 2.5) = 1.00  MAX  ← more congested despite fewer cars
+#
+# Configure in .env:  VITE_LANE_WIDTHS=3.5,3.5,4.0,3.0,4.0,3.5,3.0,4.0,3.5
+# ---------------------------------------------------------------------------
+VEHICLES_PER_METER_WIDTH: float = 2.5
+DEFAULT_LANE_WIDTH_M: float = 3.5
 
 
 def utc_now_iso() -> str:
@@ -73,8 +114,27 @@ def write_state(path: Path, payload: dict) -> None:
         json.dump(payload, tmp, indent=2)
         tmp.flush()
         os.fsync(tmp.fileno())
-        tmp_path = Path(tmp.name)
-    tmp_path.replace(path)
+        tmp_path = tmp.name
+
+    # On Windows the target file may be briefly locked by Node.js reading it.
+    # Retry os.replace() up to 5 times before falling back to a direct write.
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        json.dump(payload, f, indent=2)
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                except Exception:
+                    pass
+                return
+            time.sleep(0.05)
 
 
 def camera_urls_from_env(max_lanes: int = 9) -> List[str]:
@@ -85,6 +145,22 @@ def camera_urls_from_env(max_lanes: int = 9) -> List[str]:
     while len(parts) < max_lanes:
         parts.append('')
     return parts[:max_lanes]
+
+
+def lane_widths_from_env(max_lanes: int = 9) -> List[float]:
+    """Parse VITE_LANE_WIDTHS into a list of per-lane widths (metres)."""
+    raw = str(os.getenv('VITE_LANE_WIDTHS', '')).strip()
+    widths: List[float] = []
+    if raw:
+        for part in raw.split(','):
+            try:
+                w = float(part.strip())
+                widths.append(max(0.5, w))
+            except ValueError:
+                widths.append(DEFAULT_LANE_WIDTH_M)
+    while len(widths) < max_lanes:
+        widths.append(DEFAULT_LANE_WIDTH_M)
+    return widths[:max_lanes]
 
 
 def resolve_source(raw: str) -> Optional[str]:
@@ -104,8 +180,7 @@ def resolve_source(raw: str) -> Optional[str]:
 
 
 def is_remote_source(source: str) -> bool:
-    lower = source.lower()
-    return lower.startswith(('rtsp://', 'http://', 'https://'))
+    return source.lower().startswith(('rtsp://', 'http://', 'https://'))
 
 
 class LaneWorker:
@@ -121,44 +196,56 @@ class LaneWorker:
         self.tracker_cls = modules['tracker_cls']
         self.tracking_enabled = modules['tracking_enabled']
         self.config = config
+
+        # Width-aware congestion
+        widths = config.get('lane_widths', [])
+        self.lane_width_m: float = float(
+            widths[lane_id - 1] if widths and lane_id - 1 < len(widths) else DEFAULT_LANE_WIDTH_M
+        )
+        self.lane_capacity: float = max(1.0, self.lane_width_m * VEHICLES_PER_METER_WIDTH)
+
         self.cap = None
         self.fps = 20.0
         self.next_frame_at = 0.0
         self.next_retry_at = 0.0
         self.frame_idx = 0
         self.prev_dets = []
-        self.density_hist = deque(maxlen=config['smooth_window'])
-        self.prev_centroid = {}
-        self.track_speeds = defaultdict(list)
-        self.error = None
+        self.density_hist: deque = deque(maxlen=config['smooth_window'])
+        self.prev_centroid: dict = {}
+        self.track_speeds: dict = defaultdict(list)
+        self.error: Optional[str] = None
         self.available = False
         self.vehicle_count = 0
+        self.pedestrian_count = 0
+        self.emergency_detected = False
         self.smoothed_vehicle_count = 0.0
         self.avg_speed_kmh = 0.0
         self.observed_peak = float(config['density_reference'])
         self.updated_at = None
-        self.tracker = self.tracker_cls(max_age=config['tracker_max_age']) if self.tracking_enabled and self.tracker_cls else None
+        self.tracker = (
+            self.tracker_cls(max_age=config['tracker_max_age'])
+            if self.tracking_enabled and self.tracker_cls
+            else None
+        )
+        # Road-width estimator (optional, imported at runtime)
+        self._width_estimator = modules.get('width_estimator')
+        self.estimated_width_m: Optional[float] = None
+        self.width_confidence: float = 0.0
 
     def open_capture(self) -> bool:
         if not self.configured:
             self.available = False
             self.error = 'Lane source is not configured.'
             return False
-        if not self.resolved_source:
-            self.available = False
-            self.error = 'Lane source could not be resolved.'
-            return False
         if not is_remote_source(self.resolved_source) and not Path(self.resolved_source).exists():
             self.available = False
             self.error = f'Source not found: {self.resolved_source}'
             return False
-
         self.cap = self.cv2.VideoCapture(self.resolved_source)
         if not self.cap or not self.cap.isOpened():
             self.available = False
             self.error = f'Unable to open source: {self.resolved_source}'
             return False
-
         detected_fps = float(self.cap.get(self.cv2.CAP_PROP_FPS) or 0.0)
         if detected_fps > 0:
             self.fps = detected_fps
@@ -202,8 +289,6 @@ class LaneWorker:
 
     def maybe_process(self, now: float) -> bool:
         if not self.configured:
-            self.available = False
-            self.error = 'Lane source is not configured.'
             return False
         if now < self.next_frame_at:
             return False
@@ -219,6 +304,17 @@ class LaneWorker:
         frame_h, frame_w = frame.shape[:2]
         resized = self.cv2.resize(frame, (self.config['inference_width'], self.config['inference_height']))
 
+        # --- Road width estimation (every 30 frames to save compute) ---
+        if self._width_estimator and self.frame_idx % 30 == 0:
+            try:
+                result = self._width_estimator.estimate(resized)
+                if result.confidence > 0.3 and result.lane_width_m > 0.5:
+                    self.estimated_width_m = result.lane_width_m
+                    self.width_confidence = result.confidence
+            except Exception:
+                pass
+
+        # --- YOLO inference ---
         dets = self.prev_dets
         if self.frame_idx % self.config['skip_frames'] == 0:
             dets = []
@@ -229,15 +325,10 @@ class LaneWorker:
                 for box in results.boxes.data.tolist():
                     x1, y1, x2, y2, conf, cls = box
                     cls = int(cls)
-                    if cls not in VEHICLE_CLASSES:
+                    if cls not in ALL_DETECT_CLASSES:
                         continue
                     dets.append((
-                        [
-                            int(x1 * scale_x),
-                            int(y1 * scale_y),
-                            int(x2 * scale_x),
-                            int(y2 * scale_y),
-                        ],
+                        [int(x1 * scale_x), int(y1 * scale_y), int(x2 * scale_x), int(y2 * scale_y)],
                         float(conf),
                         cls,
                     ))
@@ -246,8 +337,12 @@ class LaneWorker:
             except Exception as exc:
                 self.error = f'Inference failed: {exc}'
 
+        # --- Tracking & per-class counting ---
         vehicle_count = 0
+        pedestrian_count = 0
+        emergency_detected = False
         avg_speed_kmh = 0.0
+
         if self.tracker is not None:
             try:
                 outputs = self.tracker.update_tracks(dets, frame=frame)
@@ -259,38 +354,53 @@ class LaneWorker:
             for track in outputs:
                 if not track.is_confirmed():
                     continue
+                cls_id = int(track.det_class) if track.det_class is not None else 2
                 active_ids.add(track.track_id)
-                vehicle_count += 1
+
+                if cls_id == PEDESTRIAN_CLASS or cls_id == CYCLIST_CLASS:
+                    pedestrian_count += 1
+                    continue
+                if cls_id in VEHICLE_CLASSES:
+                    vehicle_count += 1
+                    # Emergency heuristic: bus/truck with high confidence
+                    if cls_id in (5, 7) and (track.det_conf or 0) >= 0.82:
+                        emergency_detected = True
+
                 lx, ly, w, h = track.to_ltwh()
-                cx = int(lx + w / 2)
-                cy = int(ly + h / 2)
+                cx, cy = int(lx + w / 2), int(ly + h / 2)
                 if track.track_id in self.prev_centroid:
                     px, py = self.prev_centroid[track.track_id]
                     dist_pix = math.hypot(cx - px, cy - py)
                     speed_mps = dist_pix * self.config['scale_factor'] * self.fps / max(1, self.config['skip_frames'])
-                    speed_kmh = speed_mps * 3.6
-                    self.track_speeds[track.track_id].append(speed_kmh)
-                    lane_speeds.append(speed_kmh)
+                    lane_speeds.append(speed_mps * 3.6)
                 self.prev_centroid[track.track_id] = (cx, cy)
             avg_speed_kmh = float(sum(lane_speeds) / len(lane_speeds)) if lane_speeds else 0.0
-            self.prev_centroid = {track_id: self.prev_centroid[track_id] for track_id in active_ids if track_id in self.prev_centroid}
+            self.prev_centroid = {tid: self.prev_centroid[tid] for tid in active_ids if tid in self.prev_centroid}
         else:
-            vehicle_count = len(dets)
+            for _, conf, cls_id in dets:
+                if cls_id in (PEDESTRIAN_CLASS, CYCLIST_CLASS):
+                    pedestrian_count += 1
+                elif cls_id in VEHICLE_CLASSES:
+                    vehicle_count += 1
 
         self.vehicle_count = int(vehicle_count)
+        self.pedestrian_count = int(pedestrian_count)
+        self.emergency_detected = emergency_detected
         self.density_hist.append(float(vehicle_count))
         self.smoothed_vehicle_count = float(sum(self.density_hist) / len(self.density_hist)) if self.density_hist else 0.0
         self.avg_speed_kmh = avg_speed_kmh
-        self.observed_peak = max(self.observed_peak, self.smoothed_vehicle_count, float(self.config['density_reference']))
+        self.observed_peak = max(self.observed_peak, self.smoothed_vehicle_count)
         self.updated_at = utc_now_iso()
         self.available = True
         return True
 
     def to_state(self) -> dict:
+        # Width-aware congestion score
         congestion_norm = None
         if self.configured:
-            denominator = max(self.observed_peak, float(self.config['density_reference']), 1.0)
-            congestion_norm = max(0.0, min(1.0, self.smoothed_vehicle_count / denominator))
+            raw_score = self.smoothed_vehicle_count / self.lane_capacity
+            congestion_norm = max(0.0, min(1.0, raw_score))
+
         return {
             'id': self.id,
             'name': self.name,
@@ -299,9 +409,16 @@ class LaneWorker:
             'configured': self.configured,
             'available': self.available,
             'vehicleCount': self.vehicle_count,
+            'pedestrianCount': self.pedestrian_count,
+            'emergencyDetected': self.emergency_detected,
             'smoothedVehicleCount': round(self.smoothed_vehicle_count, 3),
             'avgSpeedKmh': round(self.avg_speed_kmh, 3),
             'observedPeak': round(self.observed_peak, 3),
+            # Width-aware fields
+            'laneWidthM': round(self.lane_width_m, 2),
+            'laneCapacity': round(self.lane_capacity, 2),
+            'estimatedWidthM': round(self.estimated_width_m, 2) if self.estimated_width_m else None,
+            'widthConfidence': round(self.width_confidence, 3),
             'congestionNorm': round(congestion_norm, 4) if congestion_norm is not None else None,
             'updatedAt': self.updated_at,
             'frameIndex': self.frame_idx,
@@ -310,9 +427,12 @@ class LaneWorker:
 
 
 def build_idle_state(camera_urls: List[str], state_file: Path, error: Optional[str] = None) -> dict:
+    lane_widths = lane_widths_from_env()
     lanes = []
     for idx, raw_source in enumerate(camera_urls, start=1):
         resolved = resolve_source(raw_source) if raw_source else None
+        width_m = lane_widths[idx - 1] if idx - 1 < len(lane_widths) else DEFAULT_LANE_WIDTH_M
+        capacity = max(1.0, width_m * VEHICLES_PER_METER_WIDTH)
         lanes.append({
             'id': idx,
             'name': f'Lane {idx}',
@@ -321,9 +441,15 @@ def build_idle_state(camera_urls: List[str], state_file: Path, error: Optional[s
             'configured': bool(raw_source),
             'available': False,
             'vehicleCount': 0,
+            'pedestrianCount': 0,
+            'emergencyDetected': False,
             'smoothedVehicleCount': 0,
             'avgSpeedKmh': 0,
             'observedPeak': 0,
+            'laneWidthM': round(width_m, 2),
+            'laneCapacity': round(capacity, 2),
+            'estimatedWidthM': None,
+            'widthConfidence': 0,
             'congestionNorm': 0 if raw_source else None,
             'updatedAt': None,
             'frameIndex': 0,
@@ -336,16 +462,20 @@ def build_idle_state(camera_urls: List[str], state_file: Path, error: Optional[s
         'stateFile': str(state_file),
         'lanes': lanes,
         'error': error,
+        'congestionModel': {
+            'formula': 'smoothedVehicleCount / (laneWidthM × VEHICLES_PER_METER_WIDTH)',
+            'vehiclesPerMeterWidth': VEHICLES_PER_METER_WIDTH,
+            'defaultLaneWidthM': DEFAULT_LANE_WIDTH_M,
+        },
     }
 
 
 def install_signal_handlers():
-    def _handle_signal(_signum, _frame):
+    def _handle(_signum, _frame):
         global RUNNING
         RUNNING = False
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle)
+    signal.signal(signal.SIGTERM, _handle)
 
 
 def load_modules(enable_tracking: bool):
@@ -354,7 +484,7 @@ def load_modules(enable_tracking: bool):
         import numpy as np
         from ultralytics import YOLO
     except Exception as exc:
-        raise RuntimeError(f'Missing runtime dependency for pseudo-live analysis: {exc}') from exc
+        raise RuntimeError(f'Missing runtime dependency: {exc}') from exc
 
     tracker_cls = None
     tracking_enabled = False
@@ -364,16 +494,28 @@ def load_modules(enable_tracking: bool):
             tracker_cls = DeepSort
             tracking_enabled = True
         except Exception as exc:
-            print(f'DeepSort unavailable, falling back to raw detection counts: {exc}', file=sys.stderr)
+            print(f'DeepSort unavailable: {exc}', file=sys.stderr)
 
-    weights_path = os.getenv('PSEUDO_LIVE_MODEL_WEIGHTS', 'yolov8n.pt')
-    model = YOLO(str((ROOT_DIR / weights_path).resolve()) if not Path(weights_path).is_absolute() else weights_path)
+    # Attempt to load road-width estimator
+    width_estimator = None
+    try:
+        sys.path.insert(0, str(ROOT_DIR))
+        from perception.road_width_estimator import RoadWidthEstimator
+        width_estimator = RoadWidthEstimator(calibration_m_per_px=0.025)
+    except Exception as exc:
+        print(f'RoadWidthEstimator unavailable (non-fatal): {exc}', file=sys.stderr)
+
+    weights_path = os.getenv('PSEUDO_LIVE_MODEL_WEIGHTS', 'yolo11n.pt')
+    resolved_weights = str((ROOT_DIR / weights_path).resolve()) if not Path(weights_path).is_absolute() else weights_path
+    model = YOLO(resolved_weights)
+
     return {
         'cv2': cv2,
         'np': np,
         'model': model,
         'tracker_cls': tracker_cls,
         'tracking_enabled': tracking_enabled,
+        'width_estimator': width_estimator,
     }
 
 
@@ -383,6 +525,8 @@ def main() -> int:
 
     state_file = Path(os.getenv('PSEUDO_LIVE_STATE_FILE', str(DEFAULT_STATE_FILE))).resolve()
     camera_urls = camera_urls_from_env()
+    lane_widths = lane_widths_from_env()
+
     config = {
         'skip_frames': max(1, env_int('PSEUDO_LIVE_DETECTION_SKIP_FRAMES', 5)),
         'smooth_window': max(1, env_int('PSEUDO_LIVE_SMOOTH_WINDOW', 12)),
@@ -394,6 +538,7 @@ def main() -> int:
         'speed_multiplier': max(0.1, env_float('PSEUDO_LIVE_SPEED_MULTIPLIER', 1.0)),
         'retry_sec': max(0.5, env_float('PSEUDO_LIVE_RETRY_SEC', 2.0)),
         'write_interval_sec': max(0.1, env_float('PSEUDO_LIVE_WRITE_INTERVAL_SEC', 0.5)),
+        'lane_widths': lane_widths,
     }
 
     try:
@@ -404,9 +549,25 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    workers = [LaneWorker(idx, raw_source, config, modules) for idx, raw_source in enumerate(camera_urls, start=1)]
+    print('Lane width configuration (metres):')
+    for i, w in enumerate(lane_widths, start=1):
+        cap = max(1.0, w * VEHICLES_PER_METER_WIDTH)
+        print(f'  Lane {i}: {w:.1f} m → capacity ≈ {cap:.1f} vehicles')
+
+    workers = [LaneWorker(idx, raw, config, modules) for idx, raw in enumerate(camera_urls, start=1)]
     for worker in workers:
         worker.open_capture()
+
+    # Attempt to load safety monitor
+    safety_monitor = None
+    try:
+        from safety_xai.safety_monitor import SafetyMonitor
+        safety_monitor = SafetyMonitor(
+            num_lanes=sum(1 for u in camera_urls if u),
+            lane_widths=[lane_widths[i] for i, u in enumerate(camera_urls) if u],
+        )
+    except Exception:
+        pass
 
     last_write_at = 0.0
     while RUNNING:
@@ -416,25 +577,59 @@ def main() -> int:
             changed = worker.maybe_process(now) or changed
 
         if changed or now - last_write_at >= config['write_interval_sec']:
+            lane_states = [w.to_state() for w in workers]
+
+            # Safety monitor check
+            safety_info = None
+            if safety_monitor:
+                try:
+                    queues = [s.get('smoothedVehicleCount', 0) for s in lane_states]
+                    ped_conflicts = [bool(s.get('pedestrianCount', 0) > 0) for s in lane_states]
+                    emerg = [bool(s.get('emergencyDetected', False)) for s in lane_states]
+                    congs = [s.get('congestionNorm') or 0 for s in lane_states]
+                    chosen_idx = int(congs.index(max(congs))) if congs else 0
+                    safe_action, log = safety_monitor.check(
+                        proposed_action=chosen_idx,
+                        queues=queues,
+                        pedestrian_conflicts=ped_conflicts,
+                        emergency_lanes=emerg,
+                    )
+                    safety_info = log.to_dict()
+                    safety_info['avgSafetyScore'] = safety_monitor.avg_safety_score()
+                except Exception:
+                    pass
+
             payload = {
                 'mode': 'pseudo-live',
                 'running': True,
                 'updatedAt': utc_now_iso(),
                 'stateFile': str(state_file),
                 'trackingEnabled': modules['tracking_enabled'],
-                'lanes': [worker.to_state() for worker in workers],
+                'congestionModel': {
+                    'formula': 'smoothedVehicleCount / (laneWidthM × VEHICLES_PER_METER_WIDTH)',
+                    'vehiclesPerMeterWidth': VEHICLES_PER_METER_WIDTH,
+                    'defaultLaneWidthM': DEFAULT_LANE_WIDTH_M,
+                },
+                'safetyMonitor': safety_info,
+                'lanes': lane_states,
             }
             write_state(state_file, payload)
             last_write_at = now
         time.sleep(0.01)
 
+    # Final state on shutdown
     payload = {
         'mode': 'pseudo-live',
         'running': False,
         'updatedAt': utc_now_iso(),
         'stateFile': str(state_file),
         'trackingEnabled': modules['tracking_enabled'],
-        'lanes': [worker.to_state() for worker in workers],
+        'congestionModel': {
+            'formula': 'smoothedVehicleCount / (laneWidthM × VEHICLES_PER_METER_WIDTH)',
+            'vehiclesPerMeterWidth': VEHICLES_PER_METER_WIDTH,
+            'defaultLaneWidthM': DEFAULT_LANE_WIDTH_M,
+        },
+        'lanes': [w.to_state() for w in workers],
     }
     write_state(state_file, payload)
     return 0

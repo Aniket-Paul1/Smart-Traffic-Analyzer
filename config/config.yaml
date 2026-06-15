@@ -1,0 +1,172 @@
+# config/config.yaml
+# Smart Traffic Analyzer — Full System Configuration
+# ===================================================
+# All modules read from this file.  Override individual values by
+# setting environment variables or passing --config-overrides on the CLI.
+
+# ──────────────────────────────────────────────────
+# System metadata
+# ──────────────────────────────────────────────────
+system:
+  name: "Smart Traffic Analyzer"
+  version: "2.0.0"
+  mode: "pseudo_live"       # Options: pseudo_live | sumo | hybrid
+  device: "cpu"             # "cpu" or "cuda"
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  seed: 42
+
+# ──────────────────────────────────────────────────
+# Lane / intersection geometry
+# ──────────────────────────────────────────────────
+lanes:
+  num_lanes: 4
+  # Physical lane widths in metres (one per lane, up to 9).
+  # Congestion = vehicleCount / (width × vehicles_per_m_width)
+  widths_m: [3.5, 3.5, 4.0, 3.0]
+  vehicles_per_m_width: 2.5      # calibration constant
+  default_width_m: 3.5
+
+# ──────────────────────────────────────────────────
+# Perception (YOLOv11 + tracking + road width)
+# ──────────────────────────────────────────────────
+perception:
+  # YOLOv11 weights — downloaded automatically by Ultralytics on first run.
+  # yolo11n.pt = nano (fastest), yolo11s.pt = small (recommended),
+  # yolo11m.pt = medium, yolo11l.pt = large (best, needs GPU)
+  model_weights: "yolo11s.pt"
+  inference_width: 640
+  inference_height: 360
+  skip_frames: 5
+  smooth_window: 12
+  scale_factor: 0.05             # metres/pixel for speed estimation
+  tracker_max_age: 20
+  enable_tracking: true
+  # Road width estimation
+  road_width:
+    enabled: true
+    calibration_m_per_px: 0.025
+    seg_model_path: null          # set to yolo11-seg .pt if available
+    bev_size: [300, 300]
+
+# ──────────────────────────────────────────────────
+# Prediction (GNN + Transformer)
+# ──────────────────────────────────────────────────
+prediction:
+  gnn:
+    enabled: true
+    t_in: 8
+    t_out: 3
+    hidden: 32
+    emb_dim: 10
+    lr: 0.001
+    batch_size: 32
+    epochs: 50
+    save_path: "gnn_predictor.pth"
+  transformer:
+    enabled: true
+    t_in: 16
+    t_out: 6
+    d_model: 64
+    n_heads: 4
+    n_layers: 2
+    ff_dim: 128
+    lr: 0.001
+    batch_size: 32
+    epochs: 50
+    save_path: "transformer_predictor.pth"
+
+# ──────────────────────────────────────────────────
+# Control (DQN + MAPPO)
+# ──────────────────────────────────────────────────
+control:
+  # DQN (existing, single-intersection)
+  dqn:
+    learning_rate: 0.0001
+    total_timesteps: 200000
+    service_fraction: 0.05
+    switch_penalty: 0.01
+    save_path: "dqn_traffic_controller"
+    tensorboard_log: "./tb_logs/"
+  # MAPPO (multi-intersection)
+  mappo:
+    enabled: false              # enable when multiple intersections deployed
+    n_agents: 1
+    hidden: 128
+    lr_actor: 0.0003
+    lr_critic: 0.001
+    gamma: 0.99
+    lam: 0.95
+    clip_eps: 0.2
+    entropy_coef: 0.01
+    vf_coef: 0.5
+    n_steps: 512
+    n_epochs: 10
+    total_epochs: 200
+    save_dir: "mappo_checkpoints"
+  # Safety-first reward weights
+  reward:
+    w_queue: 1.0
+    w_collision: 5.0
+    w_pedestrian: 8.0
+    w_speed: 3.0
+    w_emergency: 10.0
+    w_switch: 0.5
+    w_throughput: 0.5
+    narrow_road_threshold_m: 3.0
+    speed_limit_narrow_kmh: 30.0
+
+# ──────────────────────────────────────────────────
+# Safety Monitor
+# ──────────────────────────────────────────────────
+safety:
+  min_green_steps: 3
+  max_green_steps: 90
+  history_len: 200
+  target_casualty_risk: "Minimal"    # system design target = 0 casualties
+
+# ──────────────────────────────────────────────────
+# SUMO Digital Twin — DISABLED (not required)
+# ──────────────────────────────────────────────────
+simulation:
+  enabled: false
+
+# ──────────────────────────────────────────────────
+# Pseudo-live detection service
+# ──────────────────────────────────────────────────
+pseudo_live:
+  state_file: "logs/pseudo_live_state.json"
+  write_interval_sec: 0.5
+  stale_threshold_ms: 8000
+  density_reference: 10.0
+
+# ──────────────────────────────────────────────────
+# Dashboard API server
+# ──────────────────────────────────────────────────
+server:
+  port: 3001
+  jwt_secret_env: "JWT_SECRET"          # read from environment
+  token_expiry: "7d"
+  stale_ms: 8000
+  green_time_min_sec: 40
+  green_time_max_sec: 90
+  # Camera video sources (leave blank for unconfigured lanes)
+  camera_urls:
+    - "/videos/lane1.mp4"
+    - "/videos/lane2.mp4"
+    - "/videos/lane3.mp4"
+    - "/videos/lane4.mp4"
+    - ""
+    - ""
+    - ""
+    - ""
+    - ""
+
+# ──────────────────────────────────────────────────
+# Experiment tracking
+# ──────────────────────────────────────────────────
+tracking:
+  enabled: false
+  backend: "mlflow"           # or "tensorboard"
+  mlflow_uri: "mlruns"
+  experiment_name: "smart_traffic_v2"
