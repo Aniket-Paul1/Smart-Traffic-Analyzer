@@ -346,11 +346,27 @@ function getLaneRowsFromLiveState() {
     const liveLane = Array.isArray(state?.lanes) ? state.lanes.find((lane) => Number(lane.id) === base.id) : null
     if (!liveLane) return base
 
-    // Prefer width/capacity from live state (written by Python service); fall back to env-derived
-    const widthM = Number.isFinite(Number(liveLane.laneWidthM)) ? Number(liveLane.laneWidthM) : base.laneWidthM
-    const cap = Number.isFinite(Number(liveLane.laneCapacity)) ? Number(liveLane.laneCapacity) : base.laneCapacity
+    // ── Width resolution (priority order) ─────────────────────────────────
+    // 1. AI/IPM estimated width — when widthSource is 'ai_ipm', the Python
+    //    service has already updated laneWidthM to the AI value via EMA.
+    //    We trust it directly because it comes from real camera measurement.
+    // 2. laneWidthM from live state — the active effective value (may already
+    //    be AI-updated if widthSource === 'ai_ipm').
+    // 3. base.laneWidthM — derived from VITE_LANE_WIDTHS .env fallback.
+    const widthSource = liveLane.widthSource || 'config'
+    const estimatedW = Number(liveLane.estimatedWidthM)
+    const liveW = Number(liveLane.laneWidthM)
+    const widthM = widthSource === 'ai_ipm' && Number.isFinite(liveW) && liveW > 0
+      ? liveW                                           // AI is primary — already EMA-smoothed
+      : Number.isFinite(liveW) && liveW > 0
+        ? liveW                                         // config value from Python service
+        : base.laneWidthM                               // last resort: .env default
 
-    // Width-aware congestion: prefer Python-computed score, recompute if absent
+    // Recompute capacity from the resolved width so it stays consistent
+    const cap = Math.max(1, widthM * 2.5)
+
+    // Width-aware congestion: prefer Python-computed score (uses live AI width),
+    // recompute here only if Python didn't provide it
     let congestionNorm = Number(liveLane.congestionNorm)
     if (!Number.isFinite(congestionNorm)) {
       const smoothed = Number(liveLane.smoothedVehicleCount)
@@ -367,6 +383,10 @@ function getLaneRowsFromLiveState() {
       stale: !fresh,
       laneWidthM: widthM,
       laneCapacity: cap,
+      estimatedWidthM: Number.isFinite(estimatedW) ? estimatedW : null,
+      widthConfidence: Number(liveLane.widthConfidence || 0),
+      configWidthM: Number(liveLane.configWidthM || base.laneWidthM),
+      widthSource,
       congestionNorm,
       vehicleCount: Number.isFinite(Number(liveLane.vehicleCount)) ? Number(liveLane.vehicleCount) : 0,
       smoothedVehicleCount: Number.isFinite(Number(liveLane.smoothedVehicleCount)) ? Number(liveLane.smoothedVehicleCount) : 0,
@@ -1344,138 +1364,6 @@ app.get('/api/xai/decision', authMiddleware, (_req, res) => {
     safetyTarget: 'Zero casualties — pedestrian and emergency overrides always take priority.',
     congestionModel: state?.congestionModel || null,
   })
-})
-
-// ---------------------------------------------------------------------------
-// Feedback system — DB table + CRUD endpoints
-// ---------------------------------------------------------------------------
-db.run(`
-  CREATE TABLE IF NOT EXISTS feedback (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    user_name TEXT NOT NULL,
-    user_role TEXT NOT NULL,
-    title TEXT NOT NULL,
-    category TEXT NOT NULL,
-    message TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'open',
-    admin_reply TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    replied_at TEXT
-  );
-`)
-persist()
-
-// Helper: fetch all rows from a SELECT as an array of plain objects
-function queryAll(sql, params = []) {
-  const stmt = db.prepare(sql)
-  if (params.length) stmt.bind(params)
-  const rows = []
-  while (stmt.step()) {
-    rows.push(stmt.getAsObject())
-  }
-  stmt.free()
-  return rows
-}
-
-// Helper: fetch a single row
-function queryOne(sql, params = []) {
-  const stmt = db.prepare(sql)
-  if (params.length) stmt.bind(params)
-  const found = stmt.step()
-  const row = found ? stmt.getAsObject() : null
-  stmt.free()
-  return row
-}
-
-// POST /api/feedback — submit feedback (all logged-in users)
-app.post('/api/feedback', authMiddleware, (req, res) => {
-  const { title, category, message } = req.body || {}
-  if (!title?.trim() || !message?.trim()) {
-    return res.status(400).json({ error: 'Title and message are required.' })
-  }
-  const allowedCategories = ['Traffic Issue', 'Accident', 'Roadblock', 'Signal Malfunction', 'Other']
-  const cat = allowedCategories.includes(category) ? category : 'Other'
-  // JWT stores id as `sub`, name and role as-is
-  const userId = req.user.sub
-  const userName = req.user.name || req.user.email || 'Unknown'
-  const userRole = req.user.role || 'user'
-  try {
-    db.run(
-      `INSERT INTO feedback (user_id, user_name, user_role, title, category, message)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [userId, userName, userRole, title.trim(), cat, message.trim()],
-    )
-    persist()
-    res.status(201).json({ ok: true, message: 'Feedback submitted successfully.' })
-  } catch (err) {
-    console.error('[feedback POST]', err)
-    res.status(500).json({ error: 'Failed to save feedback. Please try again.' })
-  }
-})
-
-// GET /api/feedback — list feedback
-// Admin sees all; others see only their own
-app.get('/api/feedback', authMiddleware, (req, res) => {
-  try {
-    let rows
-    if (req.user.role === 'admin') {
-      rows = queryAll(
-        `SELECT id, user_id, user_name, user_role, title, category, message,
-                status, admin_reply, created_at, replied_at
-         FROM feedback ORDER BY created_at DESC`,
-      )
-    } else {
-      rows = queryAll(
-        `SELECT id, user_id, user_name, user_role, title, category, message,
-                status, admin_reply, created_at, replied_at
-         FROM feedback WHERE user_id = ? ORDER BY created_at DESC`,
-        [req.user.sub],
-      )
-    }
-    res.json({ feedback: rows })
-  } catch (err) {
-    console.error('[feedback GET]', err)
-    res.status(500).json({ error: 'Failed to load feedback.' })
-  }
-})
-
-// PATCH /api/feedback/:id/reply — admin replies to a feedback item
-app.patch('/api/feedback/:id/reply', authMiddleware, adminMiddleware, (req, res) => {
-  const id = Number(req.params.id)
-  const { reply } = req.body || {}
-  if (!reply?.trim()) return res.status(400).json({ error: 'Reply text is required.' })
-  try {
-    const existing = queryOne('SELECT id FROM feedback WHERE id = ?', [id])
-    if (!existing) return res.status(404).json({ error: 'Feedback not found.' })
-    db.run(
-      `UPDATE feedback SET admin_reply = ?, status = 'replied', replied_at = datetime('now') WHERE id = ?`,
-      [reply.trim(), id],
-    )
-    persist()
-    res.json({ ok: true })
-  } catch (err) {
-    console.error('[feedback REPLY]', err)
-    res.status(500).json({ error: 'Failed to save reply.' })
-  }
-})
-
-// PATCH /api/feedback/:id/status — admin closes/reopens a feedback item
-app.patch('/api/feedback/:id/status', authMiddleware, adminMiddleware, (req, res) => {
-  const id = Number(req.params.id)
-  const { status } = req.body || {}
-  const allowed = ['open', 'replied', 'closed']
-  if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status.' })
-  try {
-    const existing = queryOne('SELECT id FROM feedback WHERE id = ?', [id])
-    if (!existing) return res.status(404).json({ error: 'Feedback not found.' })
-    db.run('UPDATE feedback SET status = ? WHERE id = ?', [status, id])
-    persist()
-    res.json({ ok: true })
-  } catch (err) {
-    console.error('[feedback STATUS]', err)
-    res.status(500).json({ error: 'Failed to update status.' })
-  }
 })
 
 app.listen(PORT, () => {

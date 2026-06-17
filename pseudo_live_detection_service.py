@@ -199,10 +199,14 @@ class LaneWorker:
 
         # Width-aware congestion
         widths = config.get('lane_widths', [])
-        self.lane_width_m: float = float(
+        # config_width is the fallback from .env — used only when AI estimation fails
+        self.config_width_m: float = float(
             widths[lane_id - 1] if widths and lane_id - 1 < len(widths) else DEFAULT_LANE_WIDTH_M
         )
+        # lane_width_m starts as config value but gets REPLACED by AI estimate once confident
+        self.lane_width_m: float = self.config_width_m
         self.lane_capacity: float = max(1.0, self.lane_width_m * VEHICLES_PER_METER_WIDTH)
+        self.width_source: str = 'config'   # tracks which source is active: 'config' or 'ai_ipm'
 
         self.cap = None
         self.fps = 20.0
@@ -305,12 +309,34 @@ class LaneWorker:
         resized = self.cv2.resize(frame, (self.config['inference_width'], self.config['inference_height']))
 
         # --- Road width estimation (every 30 frames to save compute) ---
+        # When the AI estimator returns a confident result it becomes the PRIMARY
+        # source for lane_width_m and lane_capacity — directly affecting the
+        # congestion score.  The .env config width is only a fallback for when
+        # the camera feed is unavailable or estimation confidence is too low.
         if self._width_estimator and self.frame_idx % 30 == 0:
             try:
                 result = self._width_estimator.estimate(resized)
-                if result.confidence > 0.3 and result.lane_width_m > 0.5:
+                # Confidence threshold 0.4 — only trust the AI estimate when the
+                # road mask covers a meaningful portion of the BEV image.
+                # Width sanity check: must be between 1 m and 12 m (real road range).
+                if result.confidence >= 0.4 and 1.0 <= result.lane_width_m <= 12.0:
                     self.estimated_width_m = result.lane_width_m
                     self.width_confidence = result.confidence
+                    # ── AI estimate replaces config value as active width ──────
+                    # Use an exponential moving average so the width updates
+                    # smoothly rather than jumping frame-to-frame:
+                    #   new_width = 0.8 × old_width + 0.2 × ai_estimate
+                    alpha = 0.2
+                    self.lane_width_m = (
+                        (1 - alpha) * self.lane_width_m + alpha * result.lane_width_m
+                    )
+                    self.lane_capacity = max(1.0, self.lane_width_m * VEHICLES_PER_METER_WIDTH)
+                    self.width_source = 'ai_ipm'
+                else:
+                    # Low confidence — fall back to config width
+                    if self.width_source == 'config':
+                        self.lane_width_m = self.config_width_m
+                        self.lane_capacity = max(1.0, self.lane_width_m * VEHICLES_PER_METER_WIDTH)
             except Exception:
                 pass
 
@@ -395,7 +421,8 @@ class LaneWorker:
         return True
 
     def to_state(self) -> dict:
-        # Width-aware congestion score
+        # Width-aware congestion score — uses AI-estimated width when available,
+        # falls back to config width.  self.lane_width_m is always the ACTIVE value.
         congestion_norm = None
         if self.configured:
             raw_score = self.smoothed_vehicle_count / self.lane_capacity
@@ -414,11 +441,16 @@ class LaneWorker:
             'smoothedVehicleCount': round(self.smoothed_vehicle_count, 3),
             'avgSpeedKmh': round(self.avg_speed_kmh, 3),
             'observedPeak': round(self.observed_peak, 3),
-            # Width-aware fields
-            'laneWidthM': round(self.lane_width_m, 2),
-            'laneCapacity': round(self.lane_capacity, 2),
-            'estimatedWidthM': round(self.estimated_width_m, 2) if self.estimated_width_m else None,
+            # Active (effective) width — AI-estimated when confident, else config
+            'laneWidthM': round(self.lane_width_m, 3),
+            'laneCapacity': round(self.lane_capacity, 3),
+            # AI IPM estimate details
+            'estimatedWidthM': round(self.estimated_width_m, 3) if self.estimated_width_m else None,
             'widthConfidence': round(self.width_confidence, 3),
+            # Config fallback value — always available for comparison
+            'configWidthM': round(self.config_width_m, 2),
+            # Which source is currently driving the congestion formula
+            'widthSource': self.width_source,   # 'ai_ipm' or 'config'
             'congestionNorm': round(congestion_norm, 4) if congestion_norm is not None else None,
             'updatedAt': self.updated_at,
             'frameIndex': self.frame_idx,
