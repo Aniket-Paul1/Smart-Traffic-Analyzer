@@ -1,4 +1,4 @@
-# Smart Traffic Analyzer v2
+# Smart Traffic Analyzer
 
 AI-powered smart traffic management system with **zero-casualty design**, width-aware
 congestion scoring, YOLOv11 detection, multi-agent RL, spatio-temporal prediction,
