@@ -1366,6 +1366,136 @@ app.get('/api/xai/decision', authMiddleware, (_req, res) => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// Reusable sql.js query helpers
+// ---------------------------------------------------------------------------
+// sql.js uses stmt.step() + stmt.getAsObject() — NOT better-sqlite3's .all()/.get()
+
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql)
+  if (params.length) stmt.bind(params)
+  const rows = []
+  while (stmt.step()) rows.push(stmt.getAsObject())
+  stmt.free()
+  return rows
+}
+
+function queryOne(sql, params = []) {
+  const stmt = db.prepare(sql)
+  if (params.length) stmt.bind(params)
+  const found = stmt.step()
+  const row = found ? stmt.getAsObject() : null
+  stmt.free()
+  return row
+}
+
+// ---------------------------------------------------------------------------
+// Feedback system
+// ---------------------------------------------------------------------------
+db.run(`
+  CREATE TABLE IF NOT EXISTS feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    user_name   TEXT    NOT NULL,
+    user_role   TEXT    NOT NULL,
+    title       TEXT    NOT NULL,
+    category    TEXT    NOT NULL,
+    message     TEXT    NOT NULL,
+    status      TEXT    NOT NULL DEFAULT 'open',
+    admin_reply TEXT,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    replied_at  TEXT
+  );
+`)
+persist()
+
+// POST /api/feedback — submit (all logged-in users)
+app.post('/api/feedback', authMiddleware, (req, res) => {
+  const { title, category, message } = req.body || {}
+  if (!title?.trim() || !message?.trim()) {
+    return res.status(400).json({ error: 'Title and message are required.' })
+  }
+  const allowed = ['Traffic Issue', 'Accident', 'Roadblock', 'Signal Malfunction', 'Other']
+  const cat = allowed.includes(category) ? category : 'Other'
+  // JWT stores user id as `sub`
+  const userId   = req.user.sub
+  const userName = req.user.name  || req.user.email || 'Unknown'
+  const userRole = req.user.role  || 'user'
+  try {
+    db.run(
+      `INSERT INTO feedback (user_id, user_name, user_role, title, category, message)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [userId, userName, userRole, title.trim(), cat, message.trim()],
+    )
+    persist()
+    return res.status(201).json({ ok: true, message: 'Feedback submitted successfully.' })
+  } catch (err) {
+    console.error('[feedback POST]', err)
+    return res.status(500).json({ error: 'Failed to save feedback. Please try again.' })
+  }
+})
+
+// GET /api/feedback — admin sees all, others see only their own
+app.get('/api/feedback', authMiddleware, (req, res) => {
+  try {
+    const rows = req.user.role === 'admin'
+      ? queryAll(
+          `SELECT id, user_id, user_name, user_role, title, category, message,
+                  status, admin_reply, created_at, replied_at
+           FROM feedback ORDER BY created_at DESC`,
+        )
+      : queryAll(
+          `SELECT id, user_id, user_name, user_role, title, category, message,
+                  status, admin_reply, created_at, replied_at
+           FROM feedback WHERE user_id = ? ORDER BY created_at DESC`,
+          [req.user.sub],
+        )
+    return res.json({ feedback: rows })
+  } catch (err) {
+    console.error('[feedback GET]', err)
+    return res.status(500).json({ error: 'Failed to load feedback.' })
+  }
+})
+
+// PATCH /api/feedback/:id/reply — admin replies
+app.patch('/api/feedback/:id/reply', authMiddleware, adminMiddleware, (req, res) => {
+  const id = Number(req.params.id)
+  const { reply } = req.body || {}
+  if (!reply?.trim()) return res.status(400).json({ error: 'Reply text is required.' })
+  try {
+    const existing = queryOne('SELECT id FROM feedback WHERE id = ?', [id])
+    if (!existing) return res.status(404).json({ error: 'Feedback not found.' })
+    db.run(
+      `UPDATE feedback SET admin_reply = ?, status = 'replied', replied_at = datetime('now') WHERE id = ?`,
+      [reply.trim(), id],
+    )
+    persist()
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error('[feedback REPLY]', err)
+    return res.status(500).json({ error: 'Failed to save reply.' })
+  }
+})
+
+// PATCH /api/feedback/:id/status — admin closes/reopens
+app.patch('/api/feedback/:id/status', authMiddleware, adminMiddleware, (req, res) => {
+  const id = Number(req.params.id)
+  const { status } = req.body || {}
+  if (!['open', 'replied', 'closed'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status.' })
+  }
+  try {
+    const existing = queryOne('SELECT id FROM feedback WHERE id = ?', [id])
+    if (!existing) return res.status(404).json({ error: 'Feedback not found.' })
+    db.run('UPDATE feedback SET status = ? WHERE id = ?', [status, id])
+    persist()
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error('[feedback STATUS]', err)
+    return res.status(500).json({ error: 'Failed to update status.' })
+  }
+})
+
 app.listen(PORT, () => {
   console.log(`Traffic API listening on http://localhost:${PORT}`)
   if (ADMIN_BOOTSTRAP_EMAIL) {

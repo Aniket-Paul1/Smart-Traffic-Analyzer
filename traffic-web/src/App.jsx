@@ -29,11 +29,9 @@ function App() {
   const { user, loading, logout, isLocalUser, canManageUsers } = useAuth()
 
   // ── Navigation items ────────────────────────────────────────────────────
-  // Dashboard shown to ALL roles — local users see the denial message inside
-  // the page every time they click it (handled in DashboardPage itself).
-  // Local user:           Dashboard + Route Planner + Feedback + Parking
-  // traffic_police+admin: all above + Traffic Control
-  // admin only:           + Users
+  // All roles:   Dashboard + Route Planner + Feedback + Parking
+  // admin only:  + Users
+  // (Dashboard shows denial message to local users — handled inside the page)
   const authenticatedNav = [
     { to: '/dashboard',     label: 'Dashboard',      icon: LayoutDashboard },
     { to: '/route-planner', label: 'Route Planner',  icon: CarFront },

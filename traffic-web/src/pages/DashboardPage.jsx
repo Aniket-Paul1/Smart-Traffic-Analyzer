@@ -38,10 +38,10 @@ function DashboardDenied({ userName, role }) {
 }
 
 export default function DashboardPage() {
-  const { user, canAccessAuthority } = useAuth()
+  const { user, isLocalUser } = useAuth()
 
-  // Always show denial for local users — every time they visit this route
-  if (!canAccessAuthority) {
+  // Only deny local users — traffic_police and admin see the full dashboard
+  if (isLocalUser) {
     return <DashboardDenied userName={user?.name || 'User'} role={user?.role} />
   }
 
